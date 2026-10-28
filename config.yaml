@@ -13,18 +13,19 @@ sources:
     enabled: true
     pages: 2   # ~100 jobs/page, mostly Europe; filtered locally by keywords below
 
-  # Company career boards. Put the board slug from the company's careers URL:
-  #   https://boards.greenhouse.io/<slug>   https://jobs.lever.co/<slug>
-  #   https://jobs.ashbyhq.com/<slug>
+  # Company job boards (ATS platforms). These have no search, so each one fetches
+  # every open job from the companies listed in companies/<platform>.txt.
+  # Optional per platform:
+  #   companies_file: path to a different list
+  #   concurrency: companies fetched in parallel (default 8)
   greenhouse:
     enabled: true
-    companies: ["stripe", "airbnb", "databricks"]
   lever:
     enabled: true
-    companies: ["palantir"]
   ashby:
     enabled: true
-    companies: ["notion", "ramp"]
+  workable:
+    enabled: true
 
   # Keyword search across all Greenhouse companies via my.greenhouse.io (MyGreenhouse).
   # Needs you to be logged in: set GREENHOUSE_COOKIE (and ideally GREENHOUSE_USER_AGENT,

@@ -1,0 +1,9 @@
+# Workable companies, one per line.
+# Write the account name from the URL, or paste the URL:
+#   huggingface
+#   https://apply.workable.com/huggingface/
+#   https://huggingface.workable.com
+# (A single-job link like apply.workable.com/j/ABC123 doesn't name the company — use the company page.)
+# Anything after # is a comment.
+
+huggingface
