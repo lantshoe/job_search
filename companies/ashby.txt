@@ -1,0 +1,8 @@
+# Ashby companies, one per line.
+# Write the name from the URL, or paste the URL:
+#   notion
+#   https://jobs.ashbyhq.com/notion
+# Anything after # is a comment.
+
+notion
+ramp

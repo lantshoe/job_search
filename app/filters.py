@@ -20,16 +20,23 @@ def required_years(description: str) -> int | None:
     return min(found) if found else None
 
 
+def check_title(title: str, cfg: dict) -> tuple[bool, str | None]:
+    if cfg.get("title_include") and not _contains_any(title, cfg["title_include"]):
+        return False, "title has no include keyword"
+    if hit := _contains_any(title, cfg.get("title_exclude")):
+        return False, f"title contains '{hit.strip()}'"
+    return True, None
+
+
 def check(job: dict, cfg: dict) -> tuple[bool, str | None]:
     """Return (passed, reason_if_dropped)."""
     title = job.get("title") or ""
     desc = job.get("description") or ""
     loc = job.get("location") or ""
 
-    if cfg.get("title_include") and not _contains_any(title, cfg["title_include"]):
-        return False, "title has no include keyword"
-    if hit := _contains_any(title, cfg.get("title_exclude")):
-        return False, f"title contains '{hit.strip()}'"
+    ok, reason = check_title(title, cfg)
+    if not ok:
+        return False, reason
     if hit := _contains_any(desc, cfg.get("description_exclude")):
         return False, f"description contains '{hit}'"
     if cfg.get("location_include") and not _contains_any(loc, cfg["location_include"]):

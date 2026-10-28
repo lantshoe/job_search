@@ -1,0 +1,8 @@
+# Lever companies, one per line.
+# Write the company name from the URL, or paste the URL:
+#   palantir
+#   https://jobs.lever.co/palantir
+# EU-hosted Lever companies (jobs.eu.lever.co) work too.
+# Anything after # is a comment.
+
+palantir

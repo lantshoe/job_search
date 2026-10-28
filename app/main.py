@@ -7,7 +7,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from . import db, llm, pipeline
-from .config import DECLINE_REASONS, ROOT, load_settings
+from .config import DECLINE_REASONS, POSTED_WITHIN, ROOT, load_settings
 from .resume_parser import extract_text
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -177,9 +177,29 @@ def _start(target, *args):
     return {"started": True}
 
 
+class RunOptions(BaseModel):
+    queries: list[str] | None = None     # None = use config.yaml
+    posted_within: str | None = None     # key of POSTED_WITHIN; None = use config.yaml
+
+
+@app.get("/api/pipeline/options")
+def run_options():
+    settings = load_settings()
+    gs = (settings.get("sources") or {}).get("greenhouse_search") or {}
+    return {
+        "queries": pipeline.default_queries(settings),
+        "posted_within": {k: label for k, (label, _) in POSTED_WITHIN.items()},
+        "default_posted_within": gs.get("date_posted") if gs.get("date_posted") in POSTED_WITHIN else "any",
+    }
+
+
 @app.post("/api/pipeline/run")
-def run_pipeline(fetch: bool = True):
-    return _start(pipeline.run, fetch)
+def run_pipeline(opts: RunOptions | None = None, fetch: bool = True):
+    opts = opts or RunOptions()
+    if opts.posted_within and opts.posted_within not in POSTED_WITHIN:
+        raise HTTPException(400, f"posted_within must be one of {list(POSTED_WITHIN)}")
+    queries = [q.strip() for q in opts.queries or [] if q.strip()] or None
+    return _start(pipeline.run, fetch, queries, opts.posted_within)
 
 
 @app.post("/api/pipeline/rescore")

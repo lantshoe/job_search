@@ -150,6 +150,11 @@ def upsert_job(conn: sqlite3.Connection, job: dict) -> int | None:
     return cur.lastrowid if cur.rowcount else None
 
 
+def known_external_ids(source: str) -> set[str]:
+    with session() as conn:
+        return {r[0] for r in conn.execute("SELECT external_id FROM jobs WHERE source = ?", (source,))}
+
+
 def set_filter_result(conn, job_id: int, passed: bool, reason: str | None):
     conn.execute(
         "UPDATE jobs SET filter_status = ?, filter_reason = ? WHERE id = ?",

@@ -10,7 +10,7 @@ import re
 import httpx
 from pydantic import BaseModel
 
-from . import db
+from . import db, jd_parse
 from .config import DECLINE_REASONS, LLM_API_KEY, LLM_BASE_URL, LLM_KIND, LLM_MODEL
 
 TIMEOUT = httpx.Timeout(600, connect=20)  # Colab models can be slow; resumes take a while
@@ -157,7 +157,7 @@ Scoring guide:
 - 50-69 "weak_match": real gaps in must-haves (years, core stack, seniority) but not disqualifying.
 - 0-49 "no_match": hard blockers (much more experience required, different field, sponsorship refused, location impossible).
 
-Be concrete about gaps: name the specific requirement and what the resume shows instead. Judge only what the resume actually shows; do not assume unlisted skills. Missing nice-to-haves are "low" severity.
+Be concrete about gaps: name the specific requirement and what the resume shows instead. Judge only what the resume actually shows; do not assume unlisted skills. When the job lists MUST-HAVE and NICE-TO-HAVE requirements separately, base the score mainly on the must-haves; a missing nice-to-have is "low" severity and should barely move the score.
 
 The candidate's past decisions show what they actually want. When a job resembles ones they declined, lower the score and say why in the summary; when it resembles ones they applied to, that is a positive signal.
 
@@ -190,14 +190,27 @@ def _preferences_block(history: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def _requirements_block(desc: str) -> str:
+    """Must-have vs nice-to-have bullets parsed from the JD's headings, when it has them."""
+    s = jd_parse.sections(desc)
+    parts = []
+    if s["required"]:
+        parts.append("MUST-HAVE requirements:\n" + "\n".join(f"- {b}" for b in s["required"]))
+    if s["bonus"]:
+        parts.append("NICE-TO-HAVE (missing these is low severity):\n" + "\n".join(f"- {b}" for b in s["bonus"]))
+    return "\n\n".join(parts)
+
+
 def _format_job(job: dict, max_chars: int) -> str:
     desc = job.get("description") or ""
+    reqs = _requirements_block(desc)
     if len(desc) > max_chars:
         desc = desc[:max_chars] + "\n[... description truncated to fit the model's context ...]"
     return (
         f"Title: {job['title']}\nCompany: {job.get('company') or 'unknown'}\n"
         f"Location: {job.get('location') or 'unknown'}\nSalary: {job.get('salary') or 'not listed'}\n\n"
-        f"Job description:\n{desc}"
+        + (f"{reqs}\n\n" if reqs else "")
+        + f"Full job description:\n{desc}"
     )
 
 
