@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Job Search Assistant</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="topbar">
+  <h1>Job Search</h1>
+  <div class="resume-box">
+    <span class="muted">Resume:</span>
+    <strong id="resume-name">none</strong>
+    <label class="btn small">
+      Upload
+      <input type="file" id="resume-file" accept=".pdf,.docx,.txt,.md" hidden>
+    </label>
+  </div>
+  <div class="resume-box">
+    <span class="muted">LLM:</span>
+    <strong id="llm-name">not set</strong>
+    <button class="btn small" id="llm-btn">Set link</button>
+  </div>
+  <div class="actions">
+    <button class="btn primary" id="run-btn">Fetch &amp; score</button>
+    <button class="btn" id="rescore-btn" title="Re-rank undecided jobs using your latest feedback">Re-rank</button>
+  </div>
+  <div id="status" class="status muted"></div>
+</header>
+
+<nav class="tabs" id="tabs"></nav>
+
+<main>
+  <div class="toolbar">
+    <input type="search" id="search" placeholder="Filter by title, company, location…">
+    <select id="sort">
+      <option value="score">Sort: score</option>
+      <option value="date">Sort: newest</option>
+    </select>
+  </div>
+  <section id="insights" class="insights" hidden></section>
+  <section id="list"></section>
+</main>
+
+<!-- Job description / tailored resume viewer -->
+<dialog id="viewer">
+  <div class="dialog-head">
+    <h2 id="viewer-title"></h2>
+    <button class="btn small" data-close>Close</button>
+  </div>
+  <div class="dialog-actions" id="viewer-actions"></div>
+  <pre id="viewer-body"></pre>
+</dialog>
+
+<!-- Not-interested reason picker -->
+<dialog id="decline">
+  <form method="dialog" id="decline-form">
+    <h2>Not interested</h2>
+    <p class="muted" id="decline-job"></p>
+    <div id="reason-list" class="reason-list"></div>
+    <label class="note-label">Note (optional — helps the ranking learn)
+      <textarea id="decline-note" rows="2" placeholder="e.g. wants 5 years of Go, I have 1"></textarea>
+    </label>
+    <div class="dialog-actions">
+      <button class="btn" value="cancel" formnovalidate>Cancel</button>
+      <button class="btn primary" value="ok">Save</button>
+    </div>
+  </form>
+</dialog>
+
+<!-- LLM connection -->
+<dialog id="llm-dialog">
+  <form id="llm-form" class="form-grid">
+    <h2>LLM connection</h2>
+    <p class="muted">Paste the Cloudflare link from your Colab notebook. It changes each time the tunnel restarts — update it here.</p>
+    <label>Link
+      <input id="llm-url" type="url" placeholder="https://xxxx.trycloudflare.com" required>
+    </label>
+    <label>Server type
+      <select id="llm-kind">
+        <option value="auto">Auto-detect</option>
+        <option value="ollama">Ollama</option>
+        <option value="openai">OpenAI-compatible (vLLM, llama.cpp, LM Studio)</option>
+      </select>
+    </label>
+    <label>Model name <span class="muted">(optional — blank uses the first model on the server)</span>
+      <input id="llm-model" placeholder="e.g. qwen2.5:14b">
+    </label>
+    <label>API key <span class="muted">(optional — only if your server requires one)</span>
+      <input id="llm-key" type="password" autocomplete="off">
+    </label>
+    <p id="llm-result" class="muted"></p>
+    <div class="dialog-actions">
+      <button type="button" class="btn" data-close>Close</button>
+      <button type="submit" class="btn primary">Save &amp; test</button>
+    </div>
+  </form>
+</dialog>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

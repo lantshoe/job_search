@@ -1,0 +1,61 @@
+# ---------------------------------------------------------------------------
+# Job sources. Each source is fetched on every pipeline run.
+# All of these are free, public, no-auth job APIs.
+# ---------------------------------------------------------------------------
+sources:
+  remotive:
+    enabled: true
+    # One request per query, matched against title/description by Remotive.
+    queries: ["software engineer", "backend engineer", "data engineer"]
+    limit_per_query: 50
+
+  arbeitnow:
+    enabled: true
+    pages: 2   # ~100 jobs/page, mostly Europe; filtered locally by keywords below
+
+  # Company career boards. Put the board slug from the company's careers URL:
+  #   https://boards.greenhouse.io/<slug>   https://jobs.lever.co/<slug>
+  #   https://jobs.ashbyhq.com/<slug>
+  greenhouse:
+    enabled: true
+    companies: ["stripe", "airbnb", "databricks"]
+  lever:
+    enabled: true
+    companies: ["palantir"]
+  ashby:
+    enabled: true
+    companies: ["notion", "ramp"]
+
+# ---------------------------------------------------------------------------
+# Rough keyword filter, applied before the LLM to save cost.
+# Matching is case-insensitive. Dropped jobs are kept in the DB with a reason.
+# ---------------------------------------------------------------------------
+filter:
+  # Title must contain at least one of these (empty list = accept all titles)
+  title_include: ["engineer", "developer", "scientist", "sre", "devops"]
+  # Title must contain none of these
+  title_exclude: ["intern", "principal", "director", "vp ", "head of", "manager", "staff", "sales", "recruiter"]
+  # Description must contain none of these phrases
+  description_exclude:
+    - "unable to sponsor"
+    - "not able to sponsor"
+    - "will not sponsor"
+    - "no visa sponsorship"
+    - "us citizenship required"
+    - "must be a us citizen"
+    - "security clearance"
+  # Location must contain one of these (empty list = any location)
+  location_include: []
+  # Drop jobs that ask for more than N years ("8+ years of experience"). null = off
+  max_years_experience: 7
+  # Only keep jobs posted in the last N days (when the source gives a date). null = off
+  max_age_days: 30
+
+# ---------------------------------------------------------------------------
+# LLM scoring
+# ---------------------------------------------------------------------------
+llm:
+  max_jobs_per_run: 40     # cap how many new jobs get scored in one run
+  concurrency: 1           # parallel requests; a single Colab GPU usually handles 1-2
+  match_threshold: 70      # score >= this counts as a "match" on the dashboard
+  max_jd_chars: 8000       # long job descriptions are cut to fit small models' context
