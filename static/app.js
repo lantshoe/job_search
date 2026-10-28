@@ -134,9 +134,21 @@ function render() {
     return;
   }
   const def = TABS.find((t) => t.id === tab);
-  const q = $("#search").value.toLowerCase();
+  const q = $("#search").value.toLowerCase().trim();
+  const days = Number($("#posted-filter").value);
   let jobs = data.jobs.filter((j) => def.test(j, data.threshold));
-  if (q) jobs = jobs.filter((j) => [j.title, j.company, j.location].join(" ").toLowerCase().includes(q));
+  if (q) {
+    // Every word must appear somewhere: "python remote" matches jobs with both.
+    const words = q.split(/\s+/);
+    jobs = jobs.filter((j) => {
+      const hay = [j.title, j.company, j.location, j.summary, j.salary, ...j.matched].join(" ").toLowerCase();
+      return words.every((w) => hay.includes(w));
+    });
+  }
+  if (days) {
+    const cutoff = Date.now() - days * 86400000;
+    jobs = jobs.filter((j) => new Date(j.posted_at || j.fetched_at).getTime() >= cutoff);
+  }
   if ($("#sort").value === "date") jobs.sort((a, b) => (b.posted_at || b.fetched_at).localeCompare(a.posted_at || a.fetched_at));
   $("#list").innerHTML = jobs.length ? jobs.map(card).join("") : `<p class="empty">No jobs here.</p>`;
 }
@@ -236,6 +248,11 @@ $("#tabs").addEventListener("click", (e) => {
 });
 $("#search").addEventListener("input", render);
 $("#sort").addEventListener("change", render);
+$("#posted-filter").addEventListener("change", () => {
+  try { localStorage.setItem("postedFilter", $("#posted-filter").value); } catch {}
+  render();
+});
+try { $("#posted-filter").value = localStorage.getItem("postedFilter") || ""; } catch {}
 document.querySelectorAll("[data-close]").forEach((b) => b.addEventListener("click", () => b.closest("dialog").close()));
 
 $("#resume-file").addEventListener("change", async (e) => {
@@ -321,15 +338,36 @@ async function pollStatus() {
   }
 }
 
-async function start(path) {
+async function start(path, body = null) {
   try {
-    await api(path, { method: "POST" });
+    await api(path, body
+      ? { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }
+      : { method: "POST" });
     pollStatus();
   } catch (e) {
     setStatus(e.message, true);
   }
 }
-$("#run-btn").onclick = () => start("/api/pipeline/run");
+
+let fetchOptions = null;
+$("#run-btn").onclick = async () => {
+  if (!fetchOptions) {
+    fetchOptions = await api("/api/pipeline/options");
+    $("#fetch-queries").value = fetchOptions.queries.join("\n");
+    $("#fetch-posted").innerHTML = Object.entries(fetchOptions.posted_within)
+      .map(([k, label]) => `<option value="${k}">${esc(label)}</option>`).join("");
+    $("#fetch-posted").value = fetchOptions.default_posted_within;
+  }
+  $("#fetch-dialog").showModal();
+};
+$("#fetch-form").addEventListener("submit", (e) => {
+  e.preventDefault();
+  $("#fetch-dialog").close();
+  start("/api/pipeline/run", {
+    queries: $("#fetch-queries").value.split("\n").map((s) => s.trim()).filter(Boolean),
+    posted_within: $("#fetch-posted").value,
+  });
+});
 $("#rescore-btn").onclick = () => start("/api/pipeline/rescore");
 
 (async () => {

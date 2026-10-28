@@ -1,10 +1,11 @@
 """fetch -> keyword filter -> LLM score. Run from the web UI or: python -m app.pipeline"""
+import copy
 import logging
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from . import db, filters, llm
-from .config import load_settings
+from .config import POSTED_WITHIN, load_settings
 from .sources import fetch_all
 
 log = logging.getLogger(__name__)
@@ -20,8 +21,8 @@ def _set(stage: str, progress: str = ""):
 
 def fetch_and_filter(settings: dict) -> dict:
     _set("fetching")
-    jobs, errors = fetch_all(settings.get("sources", {}))
     filter_cfg = settings.get("filter", {})
+    jobs, errors = fetch_all(settings.get("sources", {}), filter_cfg)
     new_ids, passed = [], 0
     _set("filtering", f"{len(jobs)} fetched")
     with db.session() as conn:
@@ -77,14 +78,41 @@ def score_pending(settings: dict) -> int:
     return done
 
 
-def run(fetch: bool = True) -> dict:
+def apply_overrides(settings: dict, queries: list[str] | None = None, posted_within: str | None = None) -> dict:
+    """Keywords / time range chosen on the web page replace config.yaml for one run."""
+    s = copy.deepcopy(settings)
+    sources = s.get("sources") or {}
+    for cfg in sources.values():
+        if cfg and "queries" in cfg:
+            if queries:
+                cfg["queries"] = list(queries)
+            elif posted_within:
+                # Drop per-query date_posted so the chosen range applies to every query.
+                cfg["queries"] = [q["query"] if isinstance(q, dict) else q for q in cfg["queries"]]
+    if posted_within:
+        _, days = POSTED_WITHIN[posted_within]
+        if sources.get("greenhouse_search"):
+            sources["greenhouse_search"]["date_posted"] = None if posted_within == "any" else posted_within
+        s.setdefault("filter", {})["max_age_days"] = days
+    return s
+
+
+def default_queries(settings: dict) -> list[str]:
+    for name in ("greenhouse_search", "remotive"):
+        cfg = (settings.get("sources") or {}).get(name)
+        if cfg and cfg.get("enabled", True) and cfg.get("queries"):
+            return [q["query"] if isinstance(q, dict) else q for q in cfg["queries"]]
+    return []
+
+
+def run(fetch: bool = True, queries: list[str] | None = None, posted_within: str | None = None) -> dict:
     if not _lock.acquire(blocking=False):
         raise RuntimeError("A pipeline run is already in progress.")
     state.update(running=True, last_error=None)
     run_id = db.start_run()
     summary = {"fetched": 0, "new_jobs": 0, "passed": 0, "scored": 0}
     try:
-        settings = load_settings()
+        settings = apply_overrides(load_settings(), queries, posted_within)
         if fetch:
             f = fetch_and_filter(settings)
             summary.update({k: f[k] for k in ("fetched", "new_jobs", "passed")})
@@ -124,8 +152,10 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     p = argparse.ArgumentParser()
     p.add_argument("--no-fetch", action="store_true", help="only score jobs already in the DB")
+    p.add_argument("--query", action="append", help="keyword search (repeatable); replaces config.yaml queries")
+    p.add_argument("--posted", choices=list(POSTED_WITHIN), help="only jobs posted within this range")
     args = p.parse_args()
     db.init_db()
-    print(json.dumps(run(fetch=not args.no_fetch), indent=2))
+    print(json.dumps(run(fetch=not args.no_fetch, queries=args.query, posted_within=args.posted), indent=2))
     if state["last_error"]:
         print("warnings:", state["last_error"])

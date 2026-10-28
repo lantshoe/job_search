@@ -26,6 +26,27 @@ sources:
     enabled: true
     companies: ["notion", "ramp"]
 
+  # Keyword search across all Greenhouse companies via my.greenhouse.io (MyGreenhouse).
+  # Needs you to be logged in: set GREENHOUSE_COOKIE (and ideally GREENHOUSE_USER_AGENT,
+  # copied from the same browser) in .env. Unofficial — keep requests modest.
+  greenhouse_search:
+    enabled: true
+    # Each query is a keyword string, or {query, date_posted} to override date_posted for it.
+    # Keywords and "posted within" typed on the web page's Fetch dialog replace these for that run.
+    queries:
+      - {query: "software engineer", date_posted: past_day}
+    max_pages: 5           # per query
+    delay_seconds: 1.0     # pause between requests
+    date_posted: past_day  # default for queries that don't set one (null = any time)
+    # Sent with every search. Write values plainly (United States, not United%20States).
+    params:
+      location: United States
+      location_type: country
+      country_short_name: US
+      lat: "39.71614"
+      lon: "-96.999246"
+      "employment_type[]": full_time
+
 # ---------------------------------------------------------------------------
 # Rough keyword filter, applied before the LLM to save cost.
 # Matching is case-insensitive. Dropped jobs are kept in the DB with a reason.

@@ -31,6 +31,16 @@ DECLINE_REASONS = {
 }
 
 
+# "Posted within" choices on the Fetch dialog: key -> (label, max age in days).
+# The key is also sent to MyGreenhouse as date_posted ("past_day" is confirmed working).
+POSTED_WITHIN = {
+    "past_day": ("Past 24 hours", 1),
+    "past_week": ("Past week", 7),
+    "past_month": ("Past month", 30),
+    "any": ("Any time", None),
+}
+
+
 def load_settings() -> dict:
     with open(CONFIG_PATH) as f:
         return yaml.safe_load(f) or {}
