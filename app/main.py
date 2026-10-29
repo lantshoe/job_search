@@ -1,5 +1,6 @@
 import logging
 import threading
+from typing import Optional
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, PlainTextResponse
@@ -17,6 +18,15 @@ db.init_db()
 
 STATIC = ROOT / "static"
 app.mount("/static", StaticFiles(directory=STATIC), name="static")
+
+
+@app.middleware("http")
+async def no_stale_frontend(request, call_next):
+    # Make the browser revalidate the page, CSS and JS so edits show up on a normal reload.
+    response = await call_next(request)
+    if request.url.path == "/" or request.url.path.startswith("/static/"):
+        response.headers["Cache-Control"] = "no-cache"
+    return response
 
 
 @app.get("/")
@@ -67,8 +77,8 @@ def job_detail(job_id: int):
 
 class Decision(BaseModel):
     status: str  # applied | not_interested | new
-    reason: str | None = None
-    note: str | None = None
+    reason: Optional[str] = None
+    note: Optional[str] = None
 
 
 @app.post("/api/jobs/{job_id}/decision")
@@ -136,7 +146,7 @@ class LLMSettingsIn(BaseModel):
     base_url: str
     model: str = ""
     kind: str = "auto"
-    api_key: str | None = None  # None = keep the saved key
+    api_key: Optional[str] = None  # None = keep the saved key
 
 
 @app.post("/api/llm")
@@ -178,8 +188,8 @@ def _start(target, *args):
 
 
 class RunOptions(BaseModel):
-    queries: list[str] | None = None     # None = use config.yaml
-    posted_within: str | None = None     # key of POSTED_WITHIN; None = use config.yaml
+    queries: Optional[list[str]] = None     # None = use config.yaml
+    posted_within: Optional[str] = None     # key of POSTED_WITHIN; None = use config.yaml
 
 
 @app.get("/api/pipeline/options")
@@ -194,7 +204,7 @@ def run_options():
 
 
 @app.post("/api/pipeline/run")
-def run_pipeline(opts: RunOptions | None = None, fetch: bool = True):
+def run_pipeline(opts: Optional[RunOptions] = None, fetch: bool = True):
     opts = opts or RunOptions()
     if opts.posted_within and opts.posted_within not in POSTED_WITHIN:
         raise HTTPException(400, f"posted_within must be one of {list(POSTED_WITHIN)}")

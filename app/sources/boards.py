@@ -11,7 +11,7 @@ import logging
 import re
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Callable
+from typing import Callable, Optional
 
 import httpx
 
@@ -29,7 +29,7 @@ def _get_json(client: httpx.Client, url: str, **params):
     return r.json()
 
 
-def _join(*parts) -> str | None:
+def _join(*parts) -> Optional[str]:
     return ", ".join(p for p in parts if p) or None
 
 
@@ -166,7 +166,7 @@ PLATFORMS: dict[str, Platform] = {
 
 # ---------------------------------------------------------------- company lists
 
-def parse_company(line: str, platform: str) -> str | None:
+def parse_company(line: str, platform: str) -> Optional[str]:
     """'stripe', 'stripe  # Stripe Inc', or a careers URL -> 'stripe'. Blank/comment lines -> None."""
     line = line.split("#", 1)[0].strip()
     if not line:

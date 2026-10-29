@@ -3,6 +3,7 @@ import copy
 import logging
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Optional
 
 from . import db, filters, llm
 from .config import POSTED_WITHIN, load_settings
@@ -78,7 +79,7 @@ def score_pending(settings: dict) -> int:
     return done
 
 
-def apply_overrides(settings: dict, queries: list[str] | None = None, posted_within: str | None = None) -> dict:
+def apply_overrides(settings: dict, queries: Optional[list[str]] = None, posted_within: Optional[str] = None) -> dict:
     """Keywords / time range chosen on the web page replace config.yaml for one run."""
     s = copy.deepcopy(settings)
     sources = s.get("sources") or {}
@@ -105,7 +106,7 @@ def default_queries(settings: dict) -> list[str]:
     return []
 
 
-def run(fetch: bool = True, queries: list[str] | None = None, posted_within: str | None = None) -> dict:
+def run(fetch: bool = True, queries: Optional[list[str]] = None, posted_within: Optional[str] = None) -> dict:
     if not _lock.acquire(blocking=False):
         raise RuntimeError("A pipeline run is already in progress.")
     state.update(running=True, last_error=None)
@@ -145,7 +146,7 @@ def rescore_all():
     return run(fetch=False)
 
 
-if __name__ == "__main__":
+def main(argv=None):
     import argparse
     import json
 
@@ -154,8 +155,12 @@ if __name__ == "__main__":
     p.add_argument("--no-fetch", action="store_true", help="only score jobs already in the DB")
     p.add_argument("--query", action="append", help="keyword search (repeatable); replaces config.yaml queries")
     p.add_argument("--posted", choices=list(POSTED_WITHIN), help="only jobs posted within this range")
-    args = p.parse_args()
+    args = p.parse_args(argv)
     db.init_db()
     print(json.dumps(run(fetch=not args.no_fetch, queries=args.query, posted_within=args.posted), indent=2))
     if state["last_error"]:
         print("warnings:", state["last_error"])
+
+
+if __name__ == "__main__":
+    main()

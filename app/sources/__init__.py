@@ -8,6 +8,7 @@
 Each source is enabled and configured under `sources:` in config.yaml.
 """
 import logging
+from typing import Optional
 
 import httpx
 
@@ -21,7 +22,7 @@ log = logging.getLogger(__name__)
 ALL_SOURCES = [*AGGREGATORS, *PLATFORMS, "greenhouse_search"]
 
 
-def fetch_all(sources_cfg: dict, filter_cfg: dict | None = None) -> tuple[list[dict], list[str]]:
+def fetch_all(sources_cfg: dict, filter_cfg: Optional[dict] = None) -> tuple[list[dict], list[str]]:
     """Fetch from every enabled source. Returns (jobs, errors); one failing source doesn't stop the rest."""
     jobs, errors = [], []
     headers = {"User-Agent": "job-search-assistant/1.0"}

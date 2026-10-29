@@ -2,6 +2,7 @@ import json
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
+from typing import Optional
 
 from .config import DB_PATH
 
@@ -118,7 +119,7 @@ def add_resume(filename: str, content: str) -> int:
         return cur.lastrowid
 
 
-def active_resume() -> dict | None:
+def active_resume() -> Optional[dict]:
     with session() as conn:
         row = conn.execute("SELECT * FROM resumes WHERE is_active = 1").fetchone()
         return dict(row) if row else None
@@ -139,7 +140,7 @@ def activate_resume(resume_id: int):
 
 # ---------------------------------------------------------------- jobs
 
-def upsert_job(conn: sqlite3.Connection, job: dict) -> int | None:
+def upsert_job(conn: sqlite3.Connection, job: dict) -> Optional[int]:
     """Insert a job if unseen. Returns the new row id, or None if it already existed."""
     cur = conn.execute(
         """INSERT OR IGNORE INTO jobs
@@ -155,7 +156,7 @@ def known_external_ids(source: str) -> set[str]:
         return {r[0] for r in conn.execute("SELECT external_id FROM jobs WHERE source = ?", (source,))}
 
 
-def set_filter_result(conn, job_id: int, passed: bool, reason: str | None):
+def set_filter_result(conn, job_id: int, passed: bool, reason: Optional[str]):
     conn.execute(
         "UPDATE jobs SET filter_status = ?, filter_reason = ? WHERE id = ?",
         ("passed" if passed else "dropped", reason, job_id),
@@ -188,7 +189,7 @@ def save_score(job_id: int, resume_id: int, result: dict, model: str):
         )
 
 
-def list_jobs(resume_id: int | None) -> list[dict]:
+def list_jobs(resume_id: Optional[int]) -> list[dict]:
     with session() as conn:
         rows = conn.execute(
             """SELECT j.id, j.source, j.title, j.company, j.location, j.url, j.salary, j.posted_at,
@@ -210,13 +211,13 @@ def list_jobs(resume_id: int | None) -> list[dict]:
     return out
 
 
-def get_job(job_id: int) -> dict | None:
+def get_job(job_id: int) -> Optional[dict]:
     with session() as conn:
         row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
         return dict(row) if row else None
 
 
-def set_decision(job_id: int, status: str, reason: str | None = None, note: str | None = None):
+def set_decision(job_id: int, status: str, reason: Optional[str] = None, note: Optional[str] = None):
     with session() as conn:
         conn.execute(
             "UPDATE jobs SET status = ?, decline_reason = ?, decline_note = ?, decided_at = ? WHERE id = ?",
@@ -247,7 +248,7 @@ def save_tailored(job_id: int, resume_id: int, content: str) -> int:
         return cur.lastrowid
 
 
-def latest_tailored(job_id: int) -> dict | None:
+def latest_tailored(job_id: int) -> Optional[dict]:
     with session() as conn:
         row = conn.execute(
             "SELECT * FROM tailored_resumes WHERE job_id = ? ORDER BY id DESC LIMIT 1", (job_id,)

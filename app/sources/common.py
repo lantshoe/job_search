@@ -4,6 +4,7 @@ Every source returns normalized job dicts:
     {source, external_id, title, company, location, url, description, salary, posted_at}
 """
 from datetime import datetime, timezone
+from typing import Optional
 
 from ..jd_parse import markdown as html_to_text  # noqa: F401 - re-exported for the source modules
 
@@ -16,7 +17,7 @@ class NotFound(RuntimeError):
     """A company slug doesn't exist on that platform (usually a typo in the company list)."""
 
 
-def iso(value) -> str | None:
+def iso(value) -> Optional[str]:
     """Normalize unix seconds/ms or ISO strings to an ISO-8601 UTC string."""
     if value in (None, ""):
         return None

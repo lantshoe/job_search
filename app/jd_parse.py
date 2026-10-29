@@ -2,6 +2,7 @@
 import html
 import re
 from html.parser import HTMLParser
+from typing import Optional
 
 
 class _MD(HTMLParser):
@@ -27,7 +28,7 @@ class _MD(HTMLParser):
         self.out.append(re.sub(r"[ \t]+", " ", d))
 
 
-def markdown(raw: str | None) -> str:
+def markdown(raw: Optional[str]) -> str:
     """JD HTML -> Markdown, keeping bold headings and bullet lists."""
     if not raw:
         return ""
@@ -39,6 +40,8 @@ def markdown(raw: str | None) -> str:
     md = "".join(p.out).replace("\xa0", " ")
     md = re.sub(r"\*\*\s*\*\*", "", md)
     md = re.sub(r"[ \t]*\n[ \t]*", "\n", md)
+    # <li><p>text</p></li> (Ashby and others) leaves the dash alone on its line; rejoin it.
+    md = re.sub(r"(?m)^-\n+(?=[^\n-])", "- ", md)
     md = re.sub(r"\n{3,}", "\n\n", md)
     md = re.sub(r"(?m)^(- .*)\n\n(?=- )", r"\1\n", md)
     return md.strip()
@@ -76,6 +79,6 @@ def sections(md: str) -> dict:
     return out
 
 
-def bullets(text: str | None) -> list[str]:
+def bullets(text: Optional[str]) -> list[str]:
     return [re.sub(r"^\s*-\s*", "", line).strip()
             for line in (text or "").splitlines() if line.lstrip().startswith("- ")]

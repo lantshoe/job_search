@@ -6,6 +6,7 @@ Two server types are supported and auto-detected from the URL:
 """
 import json
 import re
+from typing import Optional
 
 import httpx
 from pydantic import BaseModel
@@ -295,7 +296,7 @@ Rules:
 - After the resume, add a section "## Notes for you" (separated by a horizontal rule) listing: the gaps you could not cover truthfully, and any questions to answer before sending (e.g. "Do you have Kubernetes experience not listed?")."""
 
 
-def tailor_resume(job: dict, resume_text: str, gaps: list[dict] | None = None, max_jd_chars: int = 8000) -> str:
+def tailor_resume(job: dict, resume_text: str, gaps: Optional[list[dict]] = None, max_jd_chars: int = 8000) -> str:
     gap_text = ""
     if gaps:
         gap_text = "\n\nKnown gaps from screening:\n" + "\n".join(

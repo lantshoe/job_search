@@ -10,6 +10,7 @@ import json
 import os
 import re
 import time
+from typing import Optional
 
 import httpx
 
@@ -42,9 +43,14 @@ def _gh_listing(raw: dict) -> dict:
 
 
 class GreenhouseSearch:
-    def __init__(self, cookie: str, user_agent: str, delay: float):
+    def __init__(self, cookie: str, user_agent: str, delay: float, version: str = ""):
         self.delay = delay
-        self.version = db.get_setting("greenhouse_inertia_version") or ""
+        # Versions to try, best first: the one learned from the last response, then the
+        # one from .env. Every successful response carries the current version, which is saved.
+        learned = db.get_setting("greenhouse_inertia_version") or ""
+        self.saved_version = learned
+        self.fallback_versions = [v for v in dict.fromkeys([learned, version]) if v]
+        self.version = self.fallback_versions.pop(0) if self.fallback_versions else ""
         self.client = httpx.Client(timeout=30, follow_redirects=False, headers={
             "Accept": "text/html, application/xhtml+xml",
             "Accept-Language": "en-US,en;q=0.9",
@@ -69,7 +75,6 @@ class GreenhouseSearch:
             raise RuntimeError("Greenhouse returned 409 and no page data to read the new version from")
         page = json.loads(html.unescape(m.group(1)))
         self.version = page.get("version") or ""
-        db.set_setting("greenhouse_inertia_version", self.version)
 
     @staticmethod
     def _check_login(r: httpx.Response):
@@ -77,21 +82,27 @@ class GreenhouseSearch:
             raise SessionExpired(EXPIRED_MSG)
 
     def get(self, params: dict) -> dict:
-        for _ in range(2):
+        for _ in range(3):
             r = self.client.get(GH_SEARCH_URL, params=params,
                                 headers={"X-Inertia": "true", "X-Inertia-Version": self.version})
             time.sleep(self.delay)
             self._check_login(r)
             if r.status_code == 409:
-                self._refresh_version(params)
+                # Version is stale: try the next known one, else read the current one from the page.
+                if self.fallback_versions:
+                    self.version = self.fallback_versions.pop(0)
+                else:
+                    self._refresh_version(params)
                 continue
             r.raise_for_status()
             d = r.json()
             if d.get("component") == "login":
                 raise SessionExpired(EXPIRED_MSG)
-            if d.get("version") and d["version"] != self.version:
-                self.version = d["version"]
+            # Remember whichever version works so the next run starts with it.
+            self.version = d.get("version") or self.version
+            if self.version != self.saved_version:
                 db.set_setting("greenhouse_inertia_version", self.version)
+                self.saved_version = self.version
             return d.get("props") or {}
         raise RuntimeError("Greenhouse search still returned 409 after refreshing the version")
 
@@ -106,7 +117,7 @@ class GreenhouseSearch:
                 return
 
 
-def fetch_greenhouse_search(client: httpx.Client, cfg: dict, filter_cfg: dict | None = None) -> list[dict]:
+def fetch_greenhouse_search(client: httpx.Client, cfg: dict, filter_cfg: Optional[dict] = None) -> list[dict]:
     cookie = os.getenv("GREENHOUSE_COOKIE", "").strip()
     if not cookie:
         raise SessionExpired("GREENHOUSE_COOKIE is not set in .env")
@@ -118,7 +129,7 @@ def fetch_greenhouse_search(client: httpx.Client, cfg: dict, filter_cfg: dict | 
     common = {k: v for k, v in (cfg.get("params") or {}).items() if v not in (None, "")}
     known = db.known_external_ids("greenhouse")
 
-    gh = GreenhouseSearch(cookie, user_agent, delay)
+    gh = GreenhouseSearch(cookie, user_agent, delay, os.getenv("GREENHOUSE_INERTIA_VERSION", "").strip())
     out, seen = [], set()
     try:
         for q in cfg.get("queries") or []:
