@@ -38,15 +38,18 @@ def fetch_and_filter(settings: dict) -> dict:
     return {"fetched": len(jobs), "new_jobs": len(new_ids), "passed": passed, "errors": errors}
 
 
-def score_pending(settings: dict) -> int:
-    resume = db.active_resume()
-    if not resume:
+def score_pending(settings: dict, rerank: bool = False) -> int:
+    resumes = db.included_resumes()
+    if not resumes:
         raise RuntimeError("Upload a resume before scoring.")
+    resume_id = resumes[0]["id"]
     llm_cfg = settings.get("llm", {})
-    pending = db.unscored_jobs(resume["id"], llm_cfg.get("max_jobs_per_run", 40))
+    limit = llm_cfg.get("max_jobs_per_run", 40)
+    pending = db.jobs_to_rerank(limit) if rerank else db.unscored_jobs(limit)
     if not pending:
         return 0
-    system = llm.build_score_system(resume["content"], db.feedback_history())
+    profile = llm.candidate_profile(resumes, db.list_facts(), llm_cfg.get("max_profile_chars", 30000))
+    system = llm.build_score_system(profile, db.feedback_history())
     max_jd_chars = llm_cfg.get("max_jd_chars", 8000)
     _, model = llm.detect(llm.get_settings())  # fail fast if the Colab link is down
 
@@ -59,7 +62,7 @@ def score_pending(settings: dict) -> int:
         nonlocal done
         try:
             job, result = fut_or_job
-            db.save_score(job["id"], resume["id"], result, model)
+            db.save_score(job["id"], resume_id, result, model)
             done += 1
         except Exception as e:  # noqa: BLE001
             failures.append(str(e))
@@ -106,7 +109,8 @@ def default_queries(settings: dict) -> list[str]:
     return []
 
 
-def run(fetch: bool = True, queries: Optional[list[str]] = None, posted_within: Optional[str] = None) -> dict:
+def run(fetch: bool = True, queries: Optional[list[str]] = None, posted_within: Optional[str] = None,
+        rerank: bool = False) -> dict:
     if not _lock.acquire(blocking=False):
         raise RuntimeError("A pipeline run is already in progress.")
     state.update(running=True, last_error=None)
@@ -119,7 +123,7 @@ def run(fetch: bool = True, queries: Optional[list[str]] = None, posted_within: 
             summary.update({k: f[k] for k in ("fetched", "new_jobs", "passed")})
             if f["errors"]:
                 state["last_error"] = "; ".join(f["errors"])
-        summary["scored"] = score_pending(settings)
+        summary["scored"] = score_pending(settings, rerank)
         db.finish_run(run_id, **summary, error=state["last_error"])
         _set("done", f"{summary['new_jobs']} new, {summary['passed']} passed filter, {summary['scored']} scored")
         return summary
@@ -134,16 +138,12 @@ def run(fetch: bool = True, queries: Optional[list[str]] = None, posted_within: 
 
 
 def rescore_all():
-    """Drop scores for undecided jobs so they get re-ranked with the latest feedback."""
-    resume = db.active_resume()
-    if not resume:
-        raise RuntimeError("Upload a resume first.")
-    with db.session() as conn:
-        conn.execute(
-            "DELETE FROM scores WHERE resume_id = ? AND job_id IN (SELECT id FROM jobs WHERE status = 'new')",
-            (resume["id"],),
-        )
-    return run(fetch=False)
+    """Re-rank undecided jobs with the latest resumes and feedback.
+
+    Old scores stay until a new one replaces them, so a failed run loses nothing.
+    Each run covers max_jobs_per_run jobs, starting with the longest since their last score.
+    """
+    return run(fetch=False, rerank=True)
 
 
 def main(argv=None):

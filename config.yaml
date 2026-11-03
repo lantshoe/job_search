@@ -81,3 +81,10 @@ llm:
   concurrency: 1           # parallel requests; a single Colab GPU usually handles 1-2
   match_threshold: 70      # score >= this counts as a "match" on the dashboard
   max_jd_chars: 8000       # long job descriptions are cut to fit small models' context
+  max_profile_chars: 30000 # all your resume versions combined; the oldest are cut beyond this
+
+# ---------------------------------------------------------------------------
+# Tailored resume export
+# ---------------------------------------------------------------------------
+resume:
+  page_size: letter       # letter or a4; tailored PDFs are fitted to one page of this size

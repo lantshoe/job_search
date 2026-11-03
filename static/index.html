@@ -10,12 +10,13 @@
 <header class="topbar">
   <h1>Job Search</h1>
   <div class="resume-box">
-    <span class="muted">Resume:</span>
+    <span class="muted">Resumes:</span>
     <strong id="resume-name">none</strong>
     <label class="btn small">
       Upload
       <input type="file" id="resume-file" accept=".pdf,.docx,.txt,.md" hidden>
     </label>
+    <button class="btn small" id="resumes-btn">Manage</button>
   </div>
   <div class="resume-box">
     <span class="muted">LLM:</span>
@@ -78,6 +79,25 @@
       <button class="btn primary" value="ok" id="decline-save" disabled>Save</button>
     </div>
   </form>
+</dialog>
+
+<!-- Resume versions and facts you confirmed -->
+<dialog id="resumes-dialog" class="resumes-dialog">
+  <h2>What the LLM knows about you</h2>
+  <p class="muted">Everything ticked here is sent together when scoring jobs and writing resumes. Every upload is kept.</p>
+  <h3>Resume versions</h3>
+  <p id="resumes-size" class="muted"></p>
+  <div id="resumes-list"></div>
+  <pre id="resume-view" class="resume-view" hidden></pre>
+  <h3>Skills and experience you confirmed</h3>
+  <p class="muted">Your answers to the LLM's questions, used for every job. Delete one to be asked again.</p>
+  <div id="facts-list"></div>
+  <form id="fact-form" class="fact-form">
+    <input id="fact-topic" placeholder="Add a skill, e.g. MySQL" required>
+    <input id="fact-detail" placeholder="Where you used it (optional)">
+    <button class="btn small primary">Add</button>
+  </form>
+  <div class="dialog-actions"><button type="button" class="btn" data-close>Close</button></div>
 </dialog>
 
 <!-- Fetch options -->

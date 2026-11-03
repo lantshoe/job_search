@@ -1,13 +1,14 @@
 import logging
+import re
 import threading
 from typing import Optional
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, Response, UploadFile
 from fastapi.responses import FileResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import db, llm, pipeline
+from . import db, llm, pipeline, resume_render
 from .config import DECLINE_REASONS, POSTED_WITHIN, ROOT, load_settings
 from .resume_parser import extract_text
 
@@ -17,6 +18,7 @@ app = FastAPI(title="Job Search Assistant")
 db.init_db()
 
 STATIC = ROOT / "static"
+MAX_PROFILE_CHARS = 30000  # all resume versions combined; the oldest are cut beyond this
 app.mount("/static", StaticFiles(directory=STATIC), name="static")
 
 
@@ -49,12 +51,53 @@ async def upload_resume(file: UploadFile = File(...)):
 
 @app.get("/api/resumes")
 def resumes():
-    return db.list_resumes()
+    included = db.included_resumes()
+    return {
+        "resumes": db.list_resumes(),
+        "facts": db.list_facts(),
+        "total_chars": sum(len(r["content"]) for r in included),
+        "max_chars": load_settings().get("llm", {}).get("max_profile_chars", MAX_PROFILE_CHARS),
+    }
 
 
-@app.post("/api/resumes/{resume_id}/activate")
-def activate(resume_id: int):
-    db.activate_resume(resume_id)
+class Included(BaseModel):
+    included: bool
+
+
+@app.post("/api/resumes/{resume_id}/included")
+def set_included(resume_id: int, body: Included):
+    db.set_resume_included(resume_id, body.included)
+    return {"ok": True}
+
+
+@app.get("/api/resumes/{resume_id}")
+def resume_text(resume_id: int):
+    r = db.get_resume(resume_id)
+    if not r:
+        raise HTTPException(404)
+    return {"id": r["id"], "filename": r["filename"], "content": r["content"]}
+
+
+# ---------------------------------------------------------------- facts you confirmed
+
+class FactIn(BaseModel):
+    topic: str
+    kind: str = "skill"
+    has: bool = True
+    detail: str = ""
+
+
+@app.post("/api/facts")
+def add_fact(body: FactIn):
+    if not body.topic.strip():
+        raise HTTPException(400, "Enter a skill or experience.")
+    db.upsert_fact(body.topic, body.kind, body.has, body.detail)
+    return {"ok": True}
+
+
+@app.delete("/api/facts/{fact_id}")
+def remove_fact(fact_id: int):
+    db.delete_fact(fact_id)
     return {"ok": True}
 
 
@@ -62,9 +105,9 @@ def activate(resume_id: int):
 
 @app.get("/api/jobs")
 def jobs():
-    resume = db.active_resume()
     threshold = load_settings().get("llm", {}).get("match_threshold", 70)
-    return {"threshold": threshold, "resume": resume and resume["filename"], "jobs": db.list_jobs(resume and resume["id"])}
+    n = len(db.included_resumes())
+    return {"threshold": threshold, "resume": n and f"{n} in use", "jobs": db.list_jobs()}
 
 
 @app.get("/api/jobs/{job_id}")
@@ -100,28 +143,228 @@ def reasons():
 
 # ---------------------------------------------------------------- tailored resume
 
-@app.post("/api/jobs/{job_id}/tailor")
-def tailor(job_id: int):
+def _max_jd_chars() -> int:
+    return load_settings().get("llm", {}).get("max_jd_chars", 8000)
+
+
+def _profile() -> str:
+    max_chars = load_settings().get("llm", {}).get("max_profile_chars", MAX_PROFILE_CHARS)
+    return llm.candidate_profile(db.included_resumes(), db.list_facts(), max_chars)
+
+
+def _tailor_context(job_id: int) -> tuple[dict, int]:
     job = db.get_job(job_id)
-    resume = db.active_resume()
+    resumes = db.included_resumes()
     if not job:
         raise HTTPException(404)
-    if not resume:
+    if not resumes:
         raise HTTPException(400, "Upload a resume first.")
-    scored = next((j for j in db.list_jobs(resume["id"]) if j["id"] == job_id), None)
-    max_jd_chars = load_settings().get("llm", {}).get("max_jd_chars", 8000)
+    return job, resumes[0]["id"]
+
+
+def _job_gaps(job_id: int) -> Optional[list]:
+    scored = next((j for j in db.list_jobs() if j["id"] == job_id), None)
+    return scored and scored["gaps"]
+
+
+def _write_resume(job: dict, resume_id: int):
+    data = llm.tailor_resume(job, _profile(), _job_gaps(job["id"]), _max_jd_chars())
+    data, fit = _fit(data, shorten=lambda r, overflow: llm.shorten_resume(job, r, overflow))
+    db.save_tailored(job["id"], resume_id, resume_render.to_markdown(data), {"resume": data, "fit": fit})
+    db.add_message(job["id"], "assistant", "written", "Here is the resume for this job.", {
+        "changes": data["changes"], "notes": data["notes"], "dropped": fit["dropped"],
+    })
+
+
+@app.post("/api/jobs/{job_id}/tailor/start")
+def tailor_start(job_id: int):
+    """Compare the job with everything known. Ask about what is missing; if nothing is, write the resume."""
+    job, resume_id = _tailor_context(job_id)
     try:
-        content = llm.tailor_resume(job, resume["content"], scored and scored["gaps"], max_jd_chars)
+        review = llm.review_job(job, _profile(), _max_jd_chars())
+        db.add_message(job_id, "assistant", "review", review["assessment"], {"plan": review["plan"]})
+        if review["questions"]:
+            db.add_message(job_id, "assistant", "questions", "One quick check before I write it.",
+                           {"questions": review["questions"]})
+        else:
+            _write_resume(job, resume_id)
     except llm.LLMError as e:
         raise HTTPException(502, str(e))
-    db.save_tailored(job_id, resume["id"], content)
-    return {"content": content}
+    return get_tailored(job_id)
+
+
+class Answer(BaseModel):
+    topic: str
+    kind: str = "skill"
+    has: Optional[bool] = None  # None = skipped; nothing is remembered
+    detail: str = ""
+
+
+class Answers(BaseModel):
+    answers: list[Answer] = []
+
+
+@app.post("/api/jobs/{job_id}/tailor")
+def tailor(job_id: int, body: Optional[Answers] = None):
+    """Remember your answers, then write the resume."""
+    job, resume_id = _tailor_context(job_id)
+    lines = []
+    for a in body.answers if body else []:
+        if a.has is None:
+            lines.append(f"{a.topic}: skipped")
+            continue
+        db.upsert_fact(a.topic, a.kind, a.has, a.detail if a.has else "", job_id)
+        lines.append(f"{a.topic}: {'yes' if a.has else 'no'}" + (f" — {a.detail.strip()}" if a.has and a.detail.strip() else ""))
+    # Recorded before the LLM call, so a failure does not lose your answers or ask again.
+    db.add_message(job_id, "user", "answers", "\n".join(lines) or "Write it without answering.")
+    try:
+        _write_resume(job, resume_id)
+    except llm.LLMError as e:
+        raise HTTPException(502, str(e))
+    return get_tailored(job_id)
+
+
+class ChatIn(BaseModel):
+    message: str
+
+
+@app.post("/api/jobs/{job_id}/tailor/chat")
+def tailor_chat(job_id: int, body: ChatIn):
+    job, resume_id = _tailor_context(job_id)
+    message = body.message.strip()
+    if not message:
+        raise HTTPException(400, "Type a message first.")
+    t = db.latest_tailored(job_id)
+    current = t["data"]["resume"] if t and t["data"] else None
+    try:
+        out = llm.chat_about_resume(job, _profile(), current, db.list_messages(job_id), message, _max_jd_chars())
+    except llm.LLMError as e:
+        raise HTTPException(502, str(e))
+    db.add_message(job_id, "user", "chat", message)
+    for f in out["facts"]:
+        db.upsert_fact(f["topic"], f["kind"], f["has"], f["detail"], job_id)
+    fit = None
+    if out["resume"]:
+        data = out["resume"]
+        data["notes"] = data["notes"] or (current or {}).get("notes", [])
+        data, fit = _fit(data, max_drops=0)
+        db.save_tailored(job_id, resume_id, resume_render.to_markdown(data), {"resume": data, "fit": fit})
+    db.add_message(job_id, "assistant", "chat", out["reply"], {
+        "updated": bool(fit), "facts": [f["topic"] for f in out["facts"]],
+    })
+    return get_tailored(job_id)
+
+
+class ResumeEdit(BaseModel):
+    resume: dict
+
+
+@app.put("/api/jobs/{job_id}/tailor")
+def edit_tailored(job_id: int, body: ResumeEdit):
+    """Save your edits as a new version. The page fit is re-checked, but nothing you wrote is cut."""
+    t = db.latest_tailored(job_id)
+    if not t or not t["data"]:
+        raise HTTPException(404, "No editable tailored resume for this job.")
+    data = resume_render.normalize(body.resume)
+    data["notes"] = t["data"]["resume"].get("notes", [])
+    data["changes"] = t["data"]["resume"].get("changes", [])
+    data, fit = _fit(data, max_drops=0)
+    fit["edited"] = True
+    db.save_tailored(job_id, t["resume_id"], resume_render.to_markdown(data), {"resume": data, "fit": fit})
+    return get_tailored(job_id)
+
+
+def _fit(data: dict, **kwargs) -> tuple[dict, dict]:
+    page_size = _page_size()
+    try:
+        return resume_render.fit(data, page_size, **kwargs)
+    except resume_render.RenderError as e:
+        # No PDF engine: still keep the content; Word export works without Chrome.
+        mid = len(resume_render.LEVELS) // 2
+        return data, {"page_size": page_size, "level": mid, "font": resume_render.LEVELS[mid]["font"],
+                      "pages": None, "error": str(e), "shortened": False, "dropped": []}
+
+
+def _latest_tailored(job_id: int) -> Optional[dict]:
+    """The newest version, with its page fit re-checked if it was saved under an older template."""
+    t = db.latest_tailored(job_id)
+    data = t and t["data"]
+    if data and data["fit"].get("layout") != resume_render.LAYOUT and not data["fit"].get("error"):
+        _, new = _fit(data["resume"], max_drops=0)  # nothing is cut; the size just adapts
+        data["fit"].update({k: new[k] for k in ("level", "font", "pages")}, layout=resume_render.LAYOUT)
+        db.update_tailored_data(t["id"], data)
+    return t
+
+
+def _page_size() -> str:
+    size = str(load_settings().get("resume", {}).get("page_size", "letter")).lower()
+    return size if size in resume_render.PAGE_SIZES else "letter"
 
 
 @app.get("/api/jobs/{job_id}/tailor")
 def get_tailored(job_id: int):
-    t = db.latest_tailored(job_id)
-    return {"content": t["content"] if t else None}
+    messages = db.list_messages(job_id)
+    # Questions stay open until the next message answers them.
+    pending = messages[-1]["data"]["questions"] if messages and messages[-1]["kind"] == "questions" else []
+    t = _latest_tailored(job_id)
+    if not t:
+        return {"content": None, "messages": messages, "pending": pending}
+    data = t["data"] or {}
+    return {
+        "messages": messages,
+        "pending": pending,
+        "id": t["id"],
+        "content": t["content"],
+        "created_at": t["created_at"],
+        "has_layout": bool(data),
+        "fit": data.get("fit"),
+        "resume": data.get("resume"),
+        "notes": (data.get("resume") or {}).get("notes", []),
+    }
+
+
+def _laid_out(job_id: int) -> tuple[dict, dict, str]:
+    t = _latest_tailored(job_id)
+    if not t:
+        raise HTTPException(404, "No tailored resume for this job yet.")
+    if not t["data"]:
+        raise HTTPException(409, "This resume was written before PDF/Word export. Regenerate it.")
+    job = db.get_job(job_id)
+    name = t["data"]["resume"].get("name") or "Resume"
+    stem = re.sub(r"[^A-Za-z0-9._ -]+", "", f"{name} - {job['company'] or 'job'}").strip() or f"resume_{job_id}"
+    return t, t["data"], stem
+
+
+def _attachment(stem: str, ext: str, download: bool) -> dict:
+    kind = "attachment" if download else "inline"
+    return {"Content-Disposition": f'{kind}; filename="{stem}.{ext}"'}
+
+
+_pdf_cache: dict[int, bytes] = {}  # tailored resume id -> PDF; the preview reloads it often
+
+
+@app.get("/api/jobs/{job_id}/tailor.pdf")
+def tailored_pdf(job_id: int, download: bool = False):
+    t, data, stem = _laid_out(job_id)
+    if t["id"] not in _pdf_cache:
+        fit = data["fit"]
+        try:
+            pdf = resume_render.render_pdf(data["resume"], resume_render.LEVELS[fit["level"]], fit["page_size"])
+        except resume_render.RenderError as e:
+            raise HTTPException(503, str(e))
+        if len(_pdf_cache) > 20:
+            _pdf_cache.clear()
+        _pdf_cache[t["id"]] = pdf
+    return Response(_pdf_cache[t["id"]], media_type="application/pdf", headers=_attachment(stem, "pdf", download))
+
+
+@app.get("/api/jobs/{job_id}/tailor.docx")
+def tailored_docx(job_id: int):
+    _, data, stem = _laid_out(job_id)
+    fit = data["fit"]
+    docx = resume_render.to_docx(data["resume"], resume_render.LEVELS[fit["level"]], fit["page_size"])
+    return Response(docx, media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    headers=_attachment(stem, "docx", True))
 
 
 @app.get("/api/jobs/{job_id}/tailor.md", response_class=PlainTextResponse)

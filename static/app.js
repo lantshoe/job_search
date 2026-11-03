@@ -6,11 +6,16 @@ let reasons = {};
 let tab = localStorage.getItem("tab") || "recommended";
 let visible = [];          // jobs currently shown in the list, in order
 let selectedId = null;
-let detailTab = "jd";      // "jd" | "resume"
 let detailKey = "";        // what the detail pane last rendered, to avoid needless re-renders
 const detailCache = {};    // job id -> full job (with description)
-const tailorCache = {};    // job id -> tailored resume markdown (null = none yet)
+const tailorCache = {};    // job id -> GET /tailor reply
+const tailorBusy = {};     // job id -> what the LLM is doing right now
+const chatDrafts = {};     // job id -> unsent chat text
+const answerDrafts = {};   // job id -> [{choice, detail}] for the open questions
 const openedPostings = new Set();  // undecided jobs whose posting you opened: ask "Did you apply?"
+const resumeDrafts = {};   // job id -> structured resume being edited (absent = not editing)
+let listHidden = false;    // hide the job list to give the description + resume more room
+try { listHidden = localStorage.getItem("listHidden") === "1"; } catch {}
 
 const TABS = [
   { id: "recommended", label: "Recommended", test: (j, t) => j.status === "new" && j.score != null && j.score >= t },
@@ -256,14 +261,21 @@ async function renderDetail() {
     return;
   }
   // Skip re-rendering when nothing visible changed (status polling reloads the list every 2s).
-  const key = [j.id, j.score, j.status, j.decline_reason, j.tailored_count, detailTab, openedPostings.has(j.id)].join("|");
+  const key = [j.id, j.score, j.status, j.decline_reason, j.tailored_count, j.id in resumeDrafts, tailorBusy[j.id] || "", tailorCache[j.id]?.messages?.length ?? "", openedPostings.has(j.id)].join("|");
   if (key === detailKey) return;
+  saveDraftFromForm();  // keep unsaved resume edits across re-renders
+  saveConvoInputs();
   const sameJob = detailKey.split("|")[0] === String(j.id);
   detailKey = key;
 
   const scrollTop = sameJob ? pane.scrollTop : 0;
   pane.innerHTML = detailHtml(j, detailCache[j.id]);
   pane.scrollTop = scrollTop;
+  pane.dataset.job = j.id;  // whose unsaved inputs are on screen
+  restoreAnswers(j.id);
+  const msgs = pane.querySelector(".msgs");
+  if (msgs) msgs.scrollTop = msgs.scrollHeight;
+  pane.style.setProperty("--pane-h", `${pane.clientHeight}px`);
 
   if (!detailCache[j.id]) {
     try {
@@ -273,14 +285,208 @@ async function renderDetail() {
     }
     if (selectedId === j.id) { detailKey = ""; renderDetail(); }
   }
-  if (detailTab === "resume" && !(j.id in tailorCache)) {
+  if (!(j.id in tailorCache)) {
     try {
-      tailorCache[j.id] = (await api(`/api/jobs/${j.id}/tailor`)).content;
+      tailorCache[j.id] = await api(`/api/jobs/${j.id}/tailor`);
     } catch {
-      tailorCache[j.id] = null;
+      tailorCache[j.id] = { content: null, messages: [], pending: [] };
     }
-    if (selectedId === j.id) { detailKey = ""; renderDetail(); }
+    if (selectedId === j.id) renderDetail();
   }
+}
+
+function fitLine(fit) {
+  if (!fit) return "";
+  if (fit.error) return `<p class="fit warn">PDF unavailable: ${esc(fit.error)} The Word download still works.</p>`;
+  if (fit.pages > 1) return fit.edited
+    ? `<p class="fit warn">⚠ Your version runs to ${fit.pages} pages even at ${fit.font}pt. Shorten something and save again.</p>`
+    : `<p class="fit warn">⚠ Still ${fit.pages} pages at the smallest readable size (${fit.font}pt). Edit it down before sending.</p>`;
+  const size = fit.page_size === "a4" ? "A4" : "Letter";
+  const how = fit.edited ? " · your edits" : fit.shortened ? " · the LLM shortened it to fit" : "";
+  return `<p class="fit ok">✓ Fits on one ${size} page · ${fit.font}pt text${how}</p>`;
+}
+
+function messageHtml(m) {
+  const d = m.data || {};
+  const list = (title, items) => (items?.length ? `<h5>${title}</h5><ul>${items.map((x) => `<li>${esc(x)}</li>`).join("")}</ul>` : "");
+  let extra = "";
+  if (m.kind === "review") extra = list("What I plan to emphasize", d.plan);
+  if (m.kind === "written") extra = list("What I changed for this job", d.changes)
+    + list("Still missing or worth checking", d.notes) + list("Left out to fit one page", d.dropped);
+  if (m.kind === "chat" && d.updated) extra += `<p class="msg-tag">✓ Resume updated</p>`;
+  if (m.kind === "chat" && d.facts?.length) extra += `<p class="msg-tag">Remembered for future jobs: ${esc(d.facts.join(", "))}</p>`;
+  return `<div class="msg ${m.role}"><div class="msg-who">${m.role === "user" ? "You" : "LLM"}</div>
+    <div class="msg-body">${esc(m.content)}${extra}</div></div>`;
+}
+
+function questionsHtml(questions) {
+  const cards = questions.map((q, i) => `<div class="question" data-i="${i}">
+      <p><span class="sev ${q.importance === "must_have" ? "high" : "low"}">${q.importance === "must_have" ? "must-have" : "nice to have"}</span>${esc(q.question)}</p>
+      <div class="answer-row">
+        <label><input type="radio" name="q${i}" value="yes"> Yes, I have it</label>
+        <label><input type="radio" name="q${i}" value="no"> No</label>
+        <label><input type="radio" name="q${i}" value="skip" checked> Skip</label>
+      </div>
+      <input class="q-detail" placeholder="If yes: where and how you used it. Only what you write here is used." aria-label="Details for ${esc(q.topic)}">
+    </div>`).join("");
+  return `<div class="questions"><h4>Please confirm</h4>${cards}
+    <p class="muted">Anything left on Skip won't be remembered. Other answers are, so you won't be asked again.</p>
+    <div class="tool-row"><button class="btn small primary" data-act="submit-answers">Write resume</button></div></div>`;
+}
+
+function convoHtml(j, t) {
+  const messages = t?.messages || [];
+  const log = messages.length
+    ? `<details class="convo" open><summary>Conversation with the LLM (${messages.length})</summary>
+       <div class="msgs">${messages.map(messageHtml).join("")}</div></details>` : "";
+  const box = tailorBusy[j.id] ? "" : `<div class="chat-box">
+      <textarea id="chat-input" rows="2" placeholder="Ask or tell the LLM anything, e.g. “I also used MySQL at Acme, add it” or “focus more on backend”">${esc(chatDrafts[j.id] || "")}</textarea>
+      <button class="btn small primary" data-act="chat-send">Send</button>
+    </div>`;
+  return { log, box };
+}
+
+function tailoredHtml(j, t) {
+  const { log, box } = convoHtml(j, t);
+  if (tailorBusy[j.id]) return `${log}<p class="empty">${esc(tailorBusy[j.id])}</p>`;
+  if (t === undefined) return `<p class="empty">Loading…</p>`;
+  if (t?.pending?.length) return `${log}${questionsHtml(t.pending)}${box}`;
+  if (!t?.content) return `${log}<div class="tool-row"><button class="btn primary" data-act="tailor">Write a tailored resume</button></div>${box}`;
+  if (!t.has_layout) return `<div class="tool-row">
+      <button class="btn small" data-act="copy-resume">Copy</button>
+      <a class="btn small" href="/api/jobs/${j.id}/tailor.md">Download .md</a>
+      <button class="btn small primary" data-act="tailor">Regenerate as PDF / Word</button>
+    </div>
+    <p class="muted">This one was written before PDF/Word export existed. Regenerate it to get a one-page PDF you can edit.</p>
+    <article class="md">${renderMarkdown(t.content)}</article>`;
+  if (resumeDrafts[j.id]) return editorHtml(resumeDrafts[j.id]);
+
+  const fit = t.fit || {};
+  const pdf = `/api/jobs/${j.id}/tailor.pdf?v=${t.id}`;
+  const preview = fit.error
+    ? `<article class="md">${renderMarkdown(t.content)}</article>`
+    : `<iframe class="resume-preview" src="${pdf}#toolbar=0&navpanes=0&view=FitH" title="Resume preview"></iframe>`;
+  return `<div class="tool-row">
+      <button class="btn small primary" data-act="edit-resume">✎ Edit</button>
+      ${fit.error ? "" : `<a class="btn small" href="${pdf}&download=1">Download PDF</a>`}
+      <a class="btn small" href="/api/jobs/${j.id}/tailor.docx?v=${t.id}"
+         title="Same layout and font size as the PDF. Word can wrap lines a little differently, so check it is still one page after editing.">Download Word</a>
+      <button class="btn small" data-act="copy-resume">Copy text</button>
+      <button class="btn small" data-act="tailor" title="Compare again with all your resumes and answers, then write a new version">Regenerate</button>
+    </div>
+    ${fitLine(t.fit)}${log}${box}${preview}`;
+}
+
+// ---- resume editor: a form over the structured resume; saving re-fits and re-renders the PDF
+
+const ENTRY_FIELDS = {
+  experience: [["title", "Title"], ["company", "Company"], ["location", "Location"], ["dates", "Dates"]],
+  projects: [["name", "Name"], ["detail", "Tech / context"], ["dates", "Dates"]],
+  education: [["school", "School"], ["degree", "Degree"], ["location", "Location"], ["dates", "Dates"], ["detail", "Details (GPA, honors…)"]],
+};
+const SECTION_LABELS = { experience: ["Experience", "job"], projects: ["Projects", "project"], education: ["Education", "school"] };
+
+function blankEntry(sec) {
+  const e = Object.fromEntries(ENTRY_FIELDS[sec].map(([k]) => [k, ""]));
+  if (sec !== "education") e.bullets = [];
+  return e;
+}
+
+function textarea(path, value, kind, placeholder = "") {
+  const rows = Math.max(2, value.split("\n").length + 1);
+  return `<textarea data-path="${path}" data-kind="${kind}" rows="${rows}" placeholder="${esc(placeholder)}">${esc(value)}</textarea>`;
+}
+
+const labeledText = (items) => items.map((x) => (x.label ? `${x.label}: ${x.items}` : x.items)).join("\n");
+
+function editorHtml(r) {
+  const field = (path, label, value, wide = false) =>
+    `<label class="${wide ? "wide" : ""}">${label}<input data-path="${path}" value="${esc(value || "")}"></label>`;
+  const section = (sec) => {
+    const [title, noun] = SECTION_LABELS[sec];
+    const cards = r[sec].map((e, i) => `<div class="entry-card">
+        <div class="entry-fields">${ENTRY_FIELDS[sec].map(([k, label]) => field(`${sec}.${i}.${k}`, label, e[k], k === "detail")).join("")}</div>
+        ${"bullets" in e ? `<label class="wide"><span>Bullets <span class="muted">(one per line)</span></span>${textarea(`${sec}.${i}.bullets`, e.bullets.join("\n"), "lines")}</label>` : ""}
+        <button type="button" class="btn small danger" data-act="remove-entry" data-sec="${sec}" data-i="${i}">Remove ${noun}</button>
+      </div>`).join("");
+    return `<fieldset><legend>${title}</legend>${cards}
+      <button type="button" class="btn small" data-act="add-entry" data-sec="${sec}">+ Add ${noun}</button></fieldset>`;
+  };
+  const actions = `<div class="tool-row">
+      <button class="btn small primary" data-act="save-resume">Save &amp; check fit</button>
+      <button class="btn small" data-act="cancel-edit">Cancel</button>
+    </div>`;
+  return `${actions}
+    <p class="muted">Saving re-checks that it fits on one page and refreshes the PDF and Word files. Nothing you write is cut automatically.</p>
+    <form class="resume-editor" onsubmit="return false">
+      <fieldset><legend>Header</legend>
+        <div class="entry-fields">${field("name", "Name", r.name)}${field("headline", "Headline", r.headline)}</div>
+        <label class="wide"><span>Contact <span class="muted">(one per line)</span></span>${textarea("contact", r.contact.join("\n"), "lines")}</label>
+      </fieldset>
+      <fieldset><legend>Summary</legend>${textarea("summary", r.summary, "text")}</fieldset>
+      <fieldset><legend>Skills</legend>
+        <label class="wide"><span class="muted">One line each, as “Label: item, item”</span>${textarea("skills", labeledText(r.skills), "labeled", "Languages: Python, Go")}</label>
+      </fieldset>
+      ${section("experience")}${section("projects")}${section("education")}
+      <fieldset><legend>Other sections</legend>
+        <label class="wide"><span class="muted">One section per line, as “Title: item, item”</span>${textarea("extra", labeledText(r.extra), "labeled", "Certifications: AWS Developer")}</label>
+      </fieldset>
+    </form>
+    ${actions}`;
+}
+
+function formToResume(form, base) {
+  const r = { ...base, experience: [], projects: [], education: [] };
+  const lines = (v) => v.split("\n").map((l) => l.trim()).filter(Boolean);
+  form.querySelectorAll("[data-path]").forEach((el) => {
+    let v = el.value;
+    if (el.dataset.kind === "lines") v = lines(v);
+    else if (el.dataset.kind === "labeled") v = lines(v).map((l) => {
+      const i = l.indexOf(":");
+      return i > 0 && i < 40 ? { label: l.slice(0, i).trim(), items: l.slice(i + 1).trim() } : { label: "", items: l };
+    });
+    else if (el.dataset.kind === "text") v = v.trim();
+    const keys = el.dataset.path.split(".");
+    let o = r;
+    keys.slice(0, -1).forEach((k) => { o = o[k] ??= {}; });
+    o[keys[keys.length - 1]] = v;
+  });
+  return r;
+}
+
+function saveDraftFromForm() {
+  const form = $("#detail .resume-editor");
+  const id = $("#detail").dataset.job;
+  if (form && id in resumeDrafts) resumeDrafts[id] = formToResume(form, resumeDrafts[id]);
+}
+
+function redrawEditor() {
+  // The draft was just changed in code; drop the old form so renderDetail doesn't read it back.
+  $("#detail .resume-editor")?.remove();
+  detailKey = "";
+  renderDetail();
+}
+
+async function saveResume(id) {
+  saveDraftFromForm();
+  setStatus("Saving and checking the page fit…");
+  try {
+    tailorCache[id] = await api(`/api/jobs/${id}/tailor`, {
+      method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ resume: resumeDrafts[id] }),
+    });
+    delete resumeDrafts[id];
+    pollStatus();  // puts the usual status line back
+  } catch (e) {
+    setStatus(`Could not save the resume: ${e.message}`, true);
+    return;
+  }
+  detailKey = "";
+  await load();
+  renderDetail();
+}
+
+function applyListHidden() {
+  $("#main").classList.toggle("list-hidden", listHidden);
 }
 
 function detailHtml(j, full) {
@@ -328,27 +534,22 @@ function detailHtml(j, full) {
     j.decline_note ? `Your note: ${j.decline_note}` : "",
   ].filter(Boolean).map((n) => `<p class="muted">${esc(n)}</p>`).join("");
 
-  let body;
-  if (detailTab === "jd") {
-    body = full
-      ? `<div class="legend">Highlighted: <mark class="warn">visa / sponsorship</mark><mark class="years">years of experience</mark><mark class="pay">pay</mark></div>
-         <article class="md">${renderMarkdown(full.description || "(no description)", { highlight: true, tagSections: true })}</article>`
-      : `<p class="empty">Loading description…</p>`;
-  } else {
-    const content = tailorCache[j.id];
-    if (content === undefined) body = `<p class="empty">Loading…</p>`;
-    else if (content === "__writing__") body = `<p class="empty">Writing a resume tailored to this job description… this can take a minute or two.</p>`;
-    else if (!content) body = `<div class="tool-row"><button class="btn primary" data-act="tailor">Write a tailored resume</button></div>
-      <p class="muted">Rewrites your uploaded resume for this job description using your LLM. It won't invent experience; gaps it can't cover are listed at the end.</p>`;
-    else body = `<div class="tool-row">
-        <button class="btn small" data-act="copy-resume">Copy</button>
-        <a class="btn small" href="/api/jobs/${j.id}/tailor.md">Download .md</a>
-        <button class="btn small" data-act="tailor">Regenerate</button>
-      </div>
-      <article class="md">${renderMarkdown(content)}</article>`;
-  }
+  const jd = full
+    ? `<div class="legend">Highlighted: <mark class="warn">visa / sponsorship</mark><mark class="years">years of experience</mark><mark class="pay">pay</mark></div>
+       <article class="md">${renderMarkdown(full.description || "(no description)", { highlight: true, tagSections: true })}</article>`
+    : `<p class="empty">Loading description…</p>`;
+  // With a tailored resume, show it beside the description so the two can be compared.
+  const split = Boolean(j.tailored_count || tailorBusy[j.id] || tailorCache[j.id]?.messages?.length);
+  if (!split) actions += `<button class="btn" data-act="tailor" title="Compare this job with all your resumes, ask about anything missing, then write a one-page resume">✎ Write tailored resume</button>`;
+  actions += `<button class="btn ghost list-toggle" data-act="toggle-list">${listHidden ? "⇥ Show job list" : "⇤ Hide job list"}</button>`;
+  const body = split
+    ? `<div class="split">
+        <section class="split-col"><h3 class="col-title">Job description</h3>${jd}</section>
+        <section class="split-col resume-col"><h3 class="col-title">Tailored resume</h3>${tailoredHtml(j, tailorCache[j.id])}</section>
+      </div>`
+    : `<h3 class="col-title">Job description</h3>${jd}`;
 
-  return `<div class="detail">
+  return `<div class="detail ${split ? "wide" : ""}">
     <button class="btn small back-btn" data-act="back">← Jobs</button>
     <div class="detail-head">
       <div class="score lg ${sc}" title="${esc(j.verdict || "")}">${scoreTxt}</div>
@@ -361,10 +562,6 @@ function detailHtml(j, full) {
     </div>
     <div class="detail-actions">${actions}</div>
     ${banner}${notes}${assessment}
-    <div class="subtabs">
-      <button class="subtab ${detailTab === "jd" ? "active" : ""}" data-subtab="jd">Job description</button>
-      <button class="subtab ${detailTab === "resume" ? "active" : ""}" data-subtab="resume">Tailored resume</button>
-    </div>
     ${body}
   </div>`;
 }
@@ -433,19 +630,74 @@ async function decide(id, status, reason = null, note = null) {
   if (!visible.some((j) => j.id === id) && next != null) select(next, { scroll: true, open: false });
 }
 
-async function tailor(id) {
-  tailorCache[id] = "__writing__";
-  detailKey = "";
+async function tailorStep(id, busyText, path, body) {
+  tailorBusy[id] = busyText;
   renderDetail();
   try {
-    tailorCache[id] = (await api(`/api/jobs/${id}/tailor`, { method: "POST" })).content;
+    tailorCache[id] = await api(path, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body || {}),
+    });
+    return true;
   } catch (e) {
-    tailorCache[id] = null;
-    setStatus(`Tailored resume failed: ${e.message}`, true);
+    setStatus(`The LLM step failed: ${e.message}`, true);
+    // A failed step may still have recorded your answers; show what is stored.
+    try { tailorCache[id] = await api(`/api/jobs/${id}/tailor`); } catch {}
+    return false;
+  } finally {
+    delete tailorBusy[id];
+    await load();
+    detailKey = "";
+    renderDetail();
   }
-  await load();
-  detailKey = "";
-  renderDetail();
+}
+
+function tailor(id) {
+  return tailorStep(id, "Comparing this job with all your resumes… this can take a minute or two.", `/api/jobs/${id}/tailor/start`);
+}
+
+function submitAnswers(id) {
+  saveConvoInputs();
+  const answers = tailorCache[id].pending.map((q, i) => {
+    const a = (answerDrafts[id] || [])[i] || {};
+    return { topic: q.topic, kind: q.kind, has: a.choice === "yes" ? true : a.choice === "no" ? false : null, detail: a.detail || "" };
+  });
+  delete answerDrafts[id];
+  return tailorStep(id, "Writing your resume and fitting it to one page… this can take a minute or two.", `/api/jobs/${id}/tailor`, { answers });
+}
+
+async function sendChat(id) {
+  const input = $("#chat-input");
+  const message = input.value.trim();
+  if (!message) return;
+  input.value = "";
+  delete chatDrafts[id];
+  const ok = await tailorStep(id, "The LLM is replying…", `/api/jobs/${id}/tailor/chat`, { message });
+  if (!ok && selectedId === id && $("#chat-input")) $("#chat-input").value = message;  // nothing you typed is lost
+}
+
+// Typed answers and chat text survive the detail pane being redrawn.
+function saveConvoInputs() {
+  const id = $("#detail").dataset.job;
+  if (!id) return;
+  const chat = $("#chat-input");
+  if (chat) chatDrafts[id] = chat.value;
+  const cards = [...document.querySelectorAll("#detail .question")];
+  if (cards.length) {
+    answerDrafts[id] = cards.map((c) => ({
+      choice: c.querySelector("input[type=radio]:checked")?.value,
+      detail: c.querySelector(".q-detail").value,
+    }));
+  }
+}
+
+function restoreAnswers(id) {
+  document.querySelectorAll("#detail .question").forEach((c, i) => {
+    const a = (answerDrafts[id] || [])[i];
+    if (!a) return;
+    const radio = c.querySelector(`input[value="${a.choice}"]`);
+    if (radio) radio.checked = true;
+    c.querySelector(".q-detail").value = a.detail;
+  });
 }
 
 function askDecline(id) {
@@ -505,8 +757,6 @@ $("#list").addEventListener("click", (e) => {
 });
 
 $("#detail").addEventListener("click", (e) => {
-  const sub = e.target.closest("[data-subtab]");
-  if (sub) { detailTab = sub.dataset.subtab; renderDetail(); return; }
   const btn = e.target.closest("[data-act]");
   if (!btn || selectedId == null) return;
   const id = selectedId;
@@ -525,7 +775,30 @@ $("#detail").addEventListener("click", (e) => {
     case "decline": return askDecline(id);
     case "undo": return decide(id, "new");
     case "tailor": return tailor(id);
-    case "copy-resume": return navigator.clipboard.writeText(tailorCache[id] || "");
+    case "copy-resume": return navigator.clipboard.writeText(tailorCache[id]?.content || "");
+    case "edit-resume":
+      resumeDrafts[id] = structuredClone(tailorCache[id].resume);
+      return renderDetail();
+    case "cancel-edit":
+      delete resumeDrafts[id];
+      return renderDetail();
+    case "save-resume": return saveResume(id);
+    case "submit-answers": return submitAnswers(id);
+    case "chat-send": return sendChat(id);
+    case "add-entry":
+      saveDraftFromForm();
+      resumeDrafts[id][btn.dataset.sec].push(blankEntry(btn.dataset.sec));
+      return redrawEditor();
+    case "remove-entry":
+      saveDraftFromForm();
+      resumeDrafts[id][btn.dataset.sec].splice(Number(btn.dataset.i), 1);
+      return redrawEditor();
+    case "toggle-list":
+      listHidden = !listHidden;
+      try { localStorage.setItem("listHidden", listHidden ? "1" : ""); } catch {}
+      applyListHidden();
+      detailKey = "";
+      return renderDetail();
     case "back": return $("#main").classList.remove("show-detail");
   }
 });
@@ -566,7 +839,7 @@ $("#resume-file").addEventListener("change", async (e) => {
   setStatus(`Uploading ${file.name}…`);
   try {
     const r = await api("/api/resumes", { method: "POST", body: fd });
-    setStatus(`Resume loaded (${r.chars} characters). Click "Fetch & score" or "Re-rank" to score jobs against it.`);
+    setStatus(`Resume saved (${r.chars} characters). Existing scores are kept; click "Re-rank" to score jobs against all your resumes.`);
     await load();
   } catch (err) {
     setStatus(err.message, true);
@@ -673,6 +946,64 @@ $("#fetch-form").addEventListener("submit", (e) => {
 });
 $("#rescore-btn").onclick = () => start("/api/pipeline/rescore");
 
+// ---- resume versions and confirmed facts
+async function loadResumesDialog() {
+  const r = await api("/api/resumes");
+  $("#resumes-size").textContent = r.total_chars > r.max_chars
+    ? `⚠ ${r.total_chars} characters in use, over the ${r.max_chars} limit, so the oldest versions get cut. Untick the ones you don't need.`
+    : `${r.total_chars} of ${r.max_chars} characters in use.`;
+  $("#resumes-list").innerHTML = r.resumes.length ? r.resumes.map((x) => `<div class="manage-row">
+      <label><input type="checkbox" data-include="${x.id}" ${x.included ? "checked" : ""}> ${esc(x.filename)}</label>
+      <span class="muted">${esc(fullTime(x.created_at))} · ${x.chars} characters</span>
+      <button type="button" class="btn small" data-view="${x.id}">View</button>
+    </div>`).join("") : `<p class="muted">No resumes yet.</p>`;
+  $("#facts-list").innerHTML = r.facts.length ? r.facts.map((f) => `<div class="manage-row">
+      <span><span class="chip ${f.has ? "ok" : ""}">${f.has ? "✓ Have" : "✗ Don't have"}</span> <strong>${esc(f.topic)}</strong>${f.detail ? ` — ${esc(f.detail)}` : ""}</span>
+      <button type="button" class="btn small danger" data-fact-del="${f.id}">Delete</button>
+    </div>`).join("") : `<p class="muted">Nothing yet.</p>`;
+}
+
+$("#resumes-btn").onclick = async () => {
+  $("#resume-view").hidden = true;
+  await loadResumesDialog();
+  $("#resumes-dialog").showModal();
+};
+$("#resumes-dialog").addEventListener("change", async (e) => {
+  const id = e.target.dataset.include;
+  if (!id) return;
+  await api(`/api/resumes/${id}/included`, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ included: e.target.checked }),
+  });
+  await loadResumesDialog();
+  await load();
+});
+$("#resumes-dialog").addEventListener("click", async (e) => {
+  const { view, factDel } = e.target.dataset;
+  if (view) {
+    $("#resume-view").textContent = (await api(`/api/resumes/${view}`)).content;
+    $("#resume-view").hidden = false;
+  }
+  if (factDel) {
+    await api(`/api/facts/${factDel}`, { method: "DELETE" });
+    await loadResumesDialog();
+  }
+});
+$("#fact-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  await api("/api/facts", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ topic: $("#fact-topic").value, detail: $("#fact-detail").value }),
+  });
+  e.target.reset();
+  await loadResumesDialog();
+});
+$("#detail").addEventListener("keydown", (e) => {
+  if (e.target.id === "chat-input" && e.key === "Enter" && (e.metaKey || e.ctrlKey) && selectedId != null) sendChat(selectedId);
+});
+
+applyListHidden();
+// The sticky resume column is sized to the detail pane's height.
+window.addEventListener("resize", () => $("#detail").style.setProperty("--pane-h", `${$("#detail").clientHeight}px`));
 (async () => {
   reasons = await api("/api/reasons");
   loadLLM();

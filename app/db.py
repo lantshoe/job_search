@@ -11,7 +11,8 @@ CREATE TABLE IF NOT EXISTS resumes (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     filename    TEXT NOT NULL,
     content     TEXT NOT NULL,
-    is_active   INTEGER NOT NULL DEFAULT 0,
+    is_active   INTEGER NOT NULL DEFAULT 0,   -- no longer used
+    included    INTEGER NOT NULL DEFAULT 1,   -- sent to the LLM
     created_at  TEXT NOT NULL
 );
 
@@ -57,7 +58,31 @@ CREATE TABLE IF NOT EXISTS tailored_resumes (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     job_id      INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
     resume_id   INTEGER NOT NULL REFERENCES resumes(id) ON DELETE CASCADE,
+    content     TEXT NOT NULL,   -- Markdown
+    data        TEXT,            -- JSON: {"resume": structured content, "fit": page-fit result}
+    created_at  TEXT NOT NULL
+);
+
+-- Answers from you that the resumes do not show ("I do have MySQL"). Used for every job.
+CREATE TABLE IF NOT EXISTS candidate_facts (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    topic       TEXT NOT NULL,
+    topic_key   TEXT NOT NULL UNIQUE,   -- lowercased topic
+    kind        TEXT NOT NULL,          -- skill / experience
+    has         INTEGER NOT NULL,       -- 1 = you have it, 0 = you do not
+    detail      TEXT,
+    job_id      INTEGER REFERENCES jobs(id) ON DELETE SET NULL,
+    created_at  TEXT NOT NULL
+);
+
+-- The conversation with the LLM about one job's resume.
+CREATE TABLE IF NOT EXISTS tailor_messages (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id      INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    role        TEXT NOT NULL,          -- user / assistant
+    kind        TEXT NOT NULL,          -- review / questions / answers / written / chat
     content     TEXT NOT NULL,
+    data        TEXT,                   -- JSON details for the page
     created_at  TEXT NOT NULL
 );
 
@@ -105,37 +130,86 @@ def session():
 def init_db():
     with session() as conn:
         conn.executescript(SCHEMA)
+        # Databases created before the PDF/Word export lack this column.
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(tailored_resumes)")}
+        if "data" not in cols:
+            conn.execute("ALTER TABLE tailored_resumes ADD COLUMN data TEXT")
+        # Older databases only used the newest upload; now every version is included by default.
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(resumes)")}
+        if "included" not in cols:
+            conn.execute("ALTER TABLE resumes ADD COLUMN included INTEGER NOT NULL DEFAULT 1")
 
 
 # ---------------------------------------------------------------- resumes
 
 def add_resume(filename: str, content: str) -> int:
+    """Every upload is kept. Re-uploading identical text just re-includes the existing copy."""
     with session() as conn:
-        conn.execute("UPDATE resumes SET is_active = 0")
+        row = conn.execute("SELECT id FROM resumes WHERE content = ? ORDER BY id DESC LIMIT 1", (content,)).fetchone()
+        if row:
+            conn.execute("UPDATE resumes SET included = 1 WHERE id = ?", (row["id"],))
+            return row["id"]
         cur = conn.execute(
-            "INSERT INTO resumes (filename, content, is_active, created_at) VALUES (?, ?, 1, ?)",
+            "INSERT INTO resumes (filename, content, is_active, included, created_at) VALUES (?, ?, 0, 1, ?)",
             (filename, content, now()),
         )
         return cur.lastrowid
 
 
-def active_resume() -> Optional[dict]:
+def included_resumes() -> list[dict]:
+    """The versions sent to the LLM, newest first, skipping exact duplicates."""
     with session() as conn:
-        row = conn.execute("SELECT * FROM resumes WHERE is_active = 1").fetchone()
-        return dict(row) if row else None
+        rows = conn.execute("SELECT * FROM resumes WHERE included = 1 ORDER BY id DESC").fetchall()
+    seen, out = set(), []
+    for r in rows:
+        if r["content"] not in seen:
+            seen.add(r["content"])
+            out.append(dict(r))
+    return out
 
 
 def list_resumes() -> list[dict]:
     with session() as conn:
         rows = conn.execute(
-            "SELECT id, filename, is_active, created_at, length(content) AS chars FROM resumes ORDER BY id DESC"
+            "SELECT id, filename, included, created_at, length(content) AS chars FROM resumes ORDER BY id DESC"
         ).fetchall()
         return [dict(r) for r in rows]
 
 
-def activate_resume(resume_id: int):
+def get_resume(resume_id: int) -> Optional[dict]:
     with session() as conn:
-        conn.execute("UPDATE resumes SET is_active = (id = ?)", (resume_id,))
+        row = conn.execute("SELECT * FROM resumes WHERE id = ?", (resume_id,)).fetchone()
+        return dict(row) if row else None
+
+
+def set_resume_included(resume_id: int, included: bool):
+    with session() as conn:
+        conn.execute("UPDATE resumes SET included = ? WHERE id = ?", (int(included), resume_id))
+
+
+# ---------------------------------------------------------------- facts you confirmed
+
+def upsert_fact(topic: str, kind: str, has: bool, detail: str = "", job_id: Optional[int] = None):
+    """One answer per topic; a newer answer replaces the older one."""
+    with session() as conn:
+        conn.execute(
+            """INSERT INTO candidate_facts (topic, topic_key, kind, has, detail, job_id, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(topic_key) DO UPDATE SET topic = excluded.topic, kind = excluded.kind, has = excluded.has,
+                 detail = excluded.detail, job_id = excluded.job_id, created_at = excluded.created_at""",
+            (topic.strip(), topic.strip().lower(), kind, int(has), detail.strip(), job_id, now()),
+        )
+
+
+def list_facts() -> list[dict]:
+    with session() as conn:
+        rows = conn.execute("SELECT * FROM candidate_facts ORDER BY topic_key").fetchall()
+        return [dict(r) for r in rows]
+
+
+def delete_fact(fact_id: int):
+    with session() as conn:
+        conn.execute("DELETE FROM candidate_facts WHERE id = ?", (fact_id,))
 
 
 # ---------------------------------------------------------------- jobs
@@ -163,14 +237,30 @@ def set_filter_result(conn, job_id: int, passed: bool, reason: Optional[str]):
     )
 
 
-def unscored_jobs(resume_id: int, limit: int) -> list[dict]:
+def unscored_jobs(limit: int = 40) -> list[dict]:
+    """Jobs with no score at all; a score from an older resume set still counts."""
     with session() as conn:
         rows = conn.execute(
             """SELECT j.* FROM jobs j
-               LEFT JOIN scores s ON s.job_id = j.id AND s.resume_id = ?
-               WHERE j.filter_status = 'passed' AND s.job_id IS NULL AND j.status = 'new'
+               WHERE j.filter_status = 'passed' AND j.status = 'new'
+                 AND NOT EXISTS (SELECT 1 FROM scores s WHERE s.job_id = j.id)
                ORDER BY j.posted_at DESC, j.id DESC LIMIT ?""",
-            (resume_id, limit),
+            (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def jobs_to_rerank(limit: int = 40) -> list[dict]:
+    """Undecided jobs, unscored first and then the longest since their last score."""
+    with session() as conn:
+        rows = conn.execute(
+            """SELECT j.* FROM jobs j
+               WHERE j.filter_status = 'passed' AND j.status = 'new'
+               ORDER BY (SELECT MAX(s.created_at) FROM scores s WHERE s.job_id = j.id) IS NOT NULL,
+                        (SELECT MAX(s.created_at) FROM scores s WHERE s.job_id = j.id),
+                        j.posted_at DESC, j.id DESC
+               LIMIT ?""",
+            (limit,),
         ).fetchall()
         return [dict(r) for r in rows]
 
@@ -189,7 +279,8 @@ def save_score(job_id: int, resume_id: int, result: dict, model: str):
         )
 
 
-def list_jobs(resume_id: Optional[int]) -> list[dict]:
+def list_jobs() -> list[dict]:
+    """Each job with its most recent score, whichever resume set produced it."""
     with session() as conn:
         rows = conn.execute(
             """SELECT j.id, j.source, j.title, j.company, j.location, j.url, j.salary, j.posted_at,
@@ -198,9 +289,10 @@ def list_jobs(resume_id: Optional[int]) -> list[dict]:
                       s.score, s.verdict, s.summary, s.matched, s.gaps, s.sponsorship, s.years_required,
                       (SELECT COUNT(*) FROM tailored_resumes t WHERE t.job_id = j.id) AS tailored_count
                FROM jobs j
-               LEFT JOIN scores s ON s.job_id = j.id AND s.resume_id = ?
-               ORDER BY s.score IS NULL, s.score DESC, j.fetched_at DESC""",
-            (resume_id or -1,),
+               LEFT JOIN scores s ON s.rowid = (
+                   SELECT x.rowid FROM scores x WHERE x.job_id = j.id
+                   ORDER BY x.created_at DESC, x.rowid DESC LIMIT 1)
+               ORDER BY s.score IS NULL, s.score DESC, j.fetched_at DESC"""
         ).fetchall()
     out = []
     for r in rows:
@@ -239,13 +331,32 @@ def feedback_history(limit: int = 40) -> list[dict]:
 
 # ---------------------------------------------------------------- tailored resumes
 
-def save_tailored(job_id: int, resume_id: int, content: str) -> int:
+def add_message(job_id: int, role: str, kind: str, content: str, data: Optional[dict] = None):
+    with session() as conn:
+        conn.execute(
+            "INSERT INTO tailor_messages (job_id, role, kind, content, data, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (job_id, role, kind, content, json.dumps(data) if data else None, now()),
+        )
+
+
+def list_messages(job_id: int) -> list[dict]:
+    with session() as conn:
+        rows = conn.execute("SELECT * FROM tailor_messages WHERE job_id = ? ORDER BY id", (job_id,)).fetchall()
+    return [{**dict(r), "data": json.loads(r["data"]) if r["data"] else None} for r in rows]
+
+
+def save_tailored(job_id: int, resume_id: int, content: str, data: Optional[dict] = None) -> int:
     with session() as conn:
         cur = conn.execute(
-            "INSERT INTO tailored_resumes (job_id, resume_id, content, created_at) VALUES (?, ?, ?, ?)",
-            (job_id, resume_id, content, now()),
+            "INSERT INTO tailored_resumes (job_id, resume_id, content, data, created_at) VALUES (?, ?, ?, ?, ?)",
+            (job_id, resume_id, content, json.dumps(data) if data else None, now()),
         )
         return cur.lastrowid
+
+
+def update_tailored_data(tailored_id: int, data: dict):
+    with session() as conn:
+        conn.execute("UPDATE tailored_resumes SET data = ? WHERE id = ?", (json.dumps(data), tailored_id))
 
 
 def latest_tailored(job_id: int) -> Optional[dict]:
@@ -253,7 +364,11 @@ def latest_tailored(job_id: int) -> Optional[dict]:
         row = conn.execute(
             "SELECT * FROM tailored_resumes WHERE job_id = ? ORDER BY id DESC LIMIT 1", (job_id,)
         ).fetchone()
-        return dict(row) if row else None
+        if not row:
+            return None
+        t = dict(row)
+        t["data"] = json.loads(t["data"]) if t["data"] else None
+        return t
 
 
 # ---------------------------------------------------------------- settings
