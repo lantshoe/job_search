@@ -367,6 +367,39 @@ def tailored_docx(job_id: int):
                     headers=_attachment(stem, "docx", True))
 
 
+class ResumeHtml(BaseModel):
+    resume: dict
+    level: Optional[int] = None  # None = the smallest readable size
+    editable: bool = False
+
+
+@app.post("/api/resume/html")
+def resume_html(body: ResumeHtml):
+    """The page as HTML, for the on-page editor and its live one-page estimate."""
+    levels = resume_render.LEVELS
+    tight = len(levels) - 1
+    index = tight if body.level is None else max(0, min(tight, body.level))
+    level, page_size = levels[index], _page_size()
+    # The editor keeps blank entries you just added; the measured copy matches what prints.
+    resume = {**body.resume} if body.editable else resume_render.normalize(body.resume)
+    _, page_h = resume_render.PAGE_SIZES[page_size]
+    return {
+        "html": resume_render.to_html(resume, level, page_size, editable=body.editable),
+        "level": index,
+        "font": level["font"],
+        "line_px": level["font"] * level["line"] * 96 / 72,
+        "content_px": (page_h - 2 * level["margin"]) * 96,
+        "margin_px": level["margin"] * 96,
+        "page_px": resume_render.PAGE_SIZES[page_size][0] * 96,
+    }
+
+
+@app.get("/api/jobs/{job_id}/tailor.html")
+def tailored_docs_html(job_id: int):
+    _, data, _ = _laid_out(job_id)
+    return Response(resume_render.to_docs_html(data["resume"]), media_type="text/html")
+
+
 @app.get("/api/jobs/{job_id}/tailor.md", response_class=PlainTextResponse)
 def download_tailored(job_id: int):
     t = db.latest_tailored(job_id)

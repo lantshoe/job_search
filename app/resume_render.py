@@ -146,52 +146,120 @@ def _e(s: str) -> str:
 
 
 def _row(left: str, right: str) -> str:
-    return f'<div class="row"><div>{left}</div><div class="right">{_e(right)}</div></div>'
+    return f'<div class="row"><div>{left}</div><div class="right">{right}</div></div>'
 
 
-def to_html(r: dict, level: dict, page_size: str = "letter") -> str:
+ENTRY_SECTIONS = {
+    # section -> (heading, fields as (key, placeholder), what the add button adds)
+    "experience": ("Experience", [("title", "Title"), ("company", "Company"), ("location", "Location")], "job"),
+    "projects": ("Projects", [("name", "Project"), ("detail", "Tech / context")], "project"),
+    "education": ("Education", [("school", "School"), ("degree", "Degree"), ("location", "Location")], "school"),
+}
+
+
+def to_html(r: dict, level: dict, page_size: str = "letter", editable: bool = False) -> str:
+    """The resume page. editable=True makes every field clickable text on the same layout.
+
+    The page's editing behaviour lives in static/app.js, which reads fields back through data-f.
+    """
     L = level
-    parts = [f'<h1>{_e(r["name"])}</h1>' if r["name"] else ""]
-    if r["headline"]:
-        parts.append(f'<div class="headline">{_e(r["headline"])}</div>')
-    if r["contact"]:
+
+    def field(key: str, value: str, placeholder: str = "", repeat: bool = False) -> str:
+        if not editable:
+            return _e(value)
+        extra = " data-repeat" if repeat else ""
+        return f'<span data-f="{key}" contenteditable="plaintext-only" data-ph="{_e(placeholder)}"{extra}>{_e(value)}</span>'
+
+    def bullets(items: list[str]) -> str:
+        items = items or ([""] if editable else [])
+        if not items:
+            return ""
+        attr = " data-repeat" if editable else ""
+        return "<ul>" + "".join(f'<li{attr}>{field("bullet", b, "Bullet")}</li>' for b in items) + "</ul>"
+
+    def entry(sec: str, e: dict) -> str:
+        _, fields, _ = ENTRY_SECTIONS[sec]
+        bits = []
+        for i, (key, ph) in enumerate(fields):
+            if not (e.get(key) or editable):
+                continue
+            text = field(key, e.get(key, ""), ph)
+            if i == 0:
+                bits.append(f"<b>{text}</b>")
+            elif i == len(fields) - 1:
+                bits.append(f'<span class="muted">· {text}</span>')
+            else:
+                bits.append(f"· {text}")
+        body = ""
+        if sec == "education":
+            if e.get("detail") or editable:
+                body = f'<p class="muted">{field("detail", e.get("detail", ""), "Details (GPA, honors…)")}</p>'
+        else:
+            body = bullets(e.get("bullets", []))
+        remove = '<button class="edit-ui rm" data-remove title="Remove">×</button>' if editable else ""
+        return f'<div class="entry" data-entry>{remove}{_row(" ".join(bits), field("dates", e.get("dates", ""), "Dates"))}{body}</div>'
+
+    parts = [f'<h1>{field("name", r["name"], "Your name")}</h1>' if r["name"] or editable else ""]
+    if r["headline"] or editable:
+        parts.append(f'<div class="headline">{field("headline", r["headline"], "Headline")}</div>')
+    if editable:
+        spans = [field("contact", c, "Contact", repeat=True) for c in r["contact"] or [""]]
+        parts.append(f'<div class="contact">{"".join(spans)}</div>')
+    elif r["contact"]:
         parts.append(f'<div class="contact">{" &nbsp;|&nbsp; ".join(_e(c) for c in r["contact"])}</div>')
-    if r["summary"]:
-        parts.append(f'<h2>Professional Summary</h2><p>{_e(r["summary"])}</p>')
-    if r["skills"]:
-        lines = "".join(
-            "<p>" + (f"<b>{_e(s['label'])}:</b> " if s["label"] else "") + _e(s["items"]) + "</p>" for s in r["skills"]
-        )
-        parts.append(f"<h2>Technical Skills</h2>{lines}")
-
-    def bullets(items):
-        return f'<ul>{"".join(f"<li>{_e(b)}</li>" for b in items)}</ul>' if items else ""
-
-    if r["experience"]:
-        items = []
-        for e in r["experience"]:
-            left = f'<b>{_e(e["title"])}</b>' + (f' · {_e(e["company"])}' if e["company"] else "")
-            left += f' <span class="muted">· {_e(e["location"])}</span>' if e["location"] else ""
-            items.append(f'<div class="entry">{_row(left, e["dates"])}{bullets(e["bullets"])}</div>')
-        parts.append("<h2>Experience</h2>" + "".join(items))
-    if r["projects"]:
-        items = []
-        for p in r["projects"]:
-            left = f'<b>{_e(p["name"])}</b>' + (f' <span class="muted">· {_e(p["detail"])}</span>' if p["detail"] else "")
-            items.append(f'<div class="entry">{_row(left, p["dates"])}{bullets(p["bullets"])}</div>')
-        parts.append("<h2>Projects</h2>" + "".join(items))
-    if r["education"]:
-        items = []
-        for e in r["education"]:
-            left = f'<b>{_e(e["school"])}</b>' + (f' · {_e(e["degree"])}' if e["degree"] else "")
-            left += f' <span class="muted">· {_e(e["location"])}</span>' if e["location"] else ""
-            detail = f'<p class="muted">{_e(e["detail"])}</p>' if e["detail"] else ""
-            items.append(f'<div class="entry">{_row(left, e["dates"])}{detail}</div>')
-        parts.append("<h2>Education</h2>" + "".join(items))
+    if r["summary"] or editable:
+        parts.append(f'<h2>Professional Summary</h2><p>{field("summary", r["summary"], "Summary")}</p>')
+    if r["skills"] or editable:
+        lines = []
+        for s in r["skills"] or [{"label": "", "items": ""}]:
+            if editable:
+                lines.append(f'<p class="skill-row" data-repeat><b>{field("label", s["label"], "Label")}:</b> {field("items", s["items"], "Skills")}</p>')
+            else:
+                lines.append("<p>" + (f"<b>{_e(s['label'])}:</b> " if s["label"] else "") + _e(s["items"]) + "</p>")
+        parts.append("<h2>Technical Skills</h2>" + "".join(lines))
+    for sec, (title, _, noun) in ENTRY_SECTIONS.items():
+        if r[sec] or editable:
+            add = f'<button class="edit-ui add" data-add="{sec}">+ Add {noun}</button>' if editable else ""
+            parts.append(f'<div data-sec="{sec}"><h2>{title}</h2>{"".join(entry(sec, e) for e in r[sec])}{add}</div>')
     for x in r["extra"]:
-        parts.append(f'<h2>{_e(x["label"] or "Other")}</h2><p>{_e(x["items"])}</p>')
+        if editable:
+            parts.append('<div data-sec="extra" data-entry><button class="edit-ui rm" data-remove title="Remove">×</button>'
+                         f'<h2>{field("label", x["label"], "Section title")}</h2><p>{field("items", x["items"], "Items")}</p></div>')
+        else:
+            parts.append(f'<h2>{_e(x["label"] or "Other")}</h2><p>{_e(x["items"])}</p>')
+    if editable:
+        parts.append('<button class="edit-ui add add-section" data-add="extra">+ Add section</button>')
 
     w, h = PAGE_SIZES.get(page_size, PAGE_SIZES["letter"])
+    edit_css = """
+[contenteditable] { outline: none; border-radius: 2px; cursor: text; }
+[contenteditable]:hover { background: #eef3fd; }
+[contenteditable]:focus { background: #e3ecfc; box-shadow: 0 0 0 1px #5b8ff0; }
+[contenteditable]:empty { display: inline-block; min-width: 3em; }
+[contenteditable]:empty::before { content: attr(data-ph); color: #aaa; font-weight: normal; }
+.contact [data-f="contact"] + [data-f="contact"]::before { content: "\\00a0|\\00a0"; color: #444; }
+body { position: relative; }
+.entry, [data-sec] { position: relative; }
+.edit-ui { font: 12px Arial, sans-serif; border: 1px solid #c9cdd3; background: #fff; color: #333; border-radius: 4px; cursor: pointer; }
+.edit-ui:hover { border-color: #5b8ff0; color: #2f6fde; }
+.add { position: absolute; right: 0; top: -2px; padding: 1px 8px; background: #fff; }
+.add-section { position: static; display: block; margin-top: 8px; }
+.page-line { position: absolute; left: 0; right: 0; height: 0; border-top: 1.5px dashed #c0392b; pointer-events: none; }
+.page-line span { position: absolute; right: 8px; top: -9px; padding: 0 6px; background: #fff; color: #c0392b; font: bold 11px Arial, sans-serif; }
+.page-line.end { border-top-color: #8a9099; }
+.page-line.end span { color: #6b7280; }
+/* While counting pages, hide what will not print, so the count matches the PDF. */
+.measuring .edit-ui, .measuring .page-line,
+.measuring .headline:has([data-f]:empty), .measuring p:has(> [data-f]:empty), .measuring li:has(> [data-f]:empty),
+.measuring h2:has(+ p > [data-f]:empty), .measuring .skill-row:has([data-f="items"]:empty),
+.measuring [data-sec]:not([data-sec="extra"]):not(:has([data-entry])),
+.measuring [data-sec="extra"]:has([data-f="items"]:empty),
+.measuring [data-sec="experience"] .entry:has([data-f="title"]:empty):has([data-f="company"]:empty),
+.measuring [data-sec="projects"] .entry:has([data-f="name"]:empty),
+.measuring [data-sec="education"] .entry:has([data-f="school"]:empty):has([data-f="degree"]:empty) { display: none !important; }
+.rm { position: absolute; left: -26px; top: 0; width: 20px; height: 20px; padding: 0; opacity: 0; color: #c0392b; }
+.entry:hover > .rm, [data-sec="extra"]:hover > .rm, .rm:focus { opacity: 1; }
+""" if editable else ""
     return f"""<!doctype html><html><head><meta charset="utf-8"><style>
 @page {{ size: {w}in {h}in; margin: {L['margin']}in; }}
 * {{ box-sizing: border-box; }}
@@ -210,7 +278,65 @@ p {{ margin: 0 0 1.5pt; }}
 .muted {{ color: #444; }}
 ul {{ margin: 1pt 0 0; padding-left: 14pt; }}
 li {{ margin: 0 0 1pt; }}
-</style></head><body>{"".join(parts)}</body></html>"""
+@media screen {{
+  html {{ background: #fff; }}
+  body {{ box-sizing: content-box; width: {w - 2 * L['margin']:.3f}in; margin: 0; padding: {L['margin']}in; }}
+}}
+{edit_css}</style></head><body>{"".join(parts)}</body></html>"""
+
+
+def to_docs_html(r: dict) -> str:
+    """Self-contained HTML for pasting into Google Docs, which keeps inline styles but no stylesheet."""
+    base = f"font-family:{FONT};font-size:10.5pt;color:#111;margin:0"
+
+    def center(text: str, size: float, bold: bool = False) -> str:
+        return f'<p style="{base};font-size:{size}pt;text-align:center;{"font-weight:bold;" if bold else ""}">{_e(text)}</p>'
+
+    def heading(text: str) -> str:
+        return (f'<p style="{base};font-size:11pt;font-weight:bold;margin-top:14pt;margin-bottom:3pt;'
+                f'border-bottom:1px solid #999">{_e(text.upper())}</p>')
+
+    def para(inner: str, top: float = 0) -> str:
+        return f'<p style="{base};margin-top:{top}pt">{inner}</p>'
+
+    def bullets(items: list[str]) -> str:
+        if not items:
+            return ""
+        return f'<ul style="margin:0">{"".join(f"""<li style="{base}">{_e(b)}</li>""" for b in items)}</ul>'
+
+    def line(bold: str, rest: list[str], dates: str) -> str:
+        text = " · ".join([f"<b>{_e(bold)}</b>", *[_e(x) for x in rest if x]])
+        return para(text + (f" &nbsp;|&nbsp; <b>{_e(dates)}</b>" if dates else ""), 6)
+
+    out = []
+    if r["name"]:
+        out.append(center(r["name"], 20, bold=True))
+    if r["headline"]:
+        out.append(center(r["headline"], 11.5))
+    if r["contact"]:
+        out.append(center("  |  ".join(r["contact"]), 10.5))
+    if r["summary"]:
+        out += [heading("Professional Summary"), para(_e(r["summary"]))]
+    if r["skills"]:
+        out.append(heading("Technical Skills"))
+        out += [para((f"<b>{_e(s['label'])}:</b> " if s["label"] else "") + _e(s["items"])) for s in r["skills"]]
+    if r["experience"]:
+        out.append(heading("Experience"))
+        for e in r["experience"]:
+            out += [line(e["title"], [e["company"], e["location"]], e["dates"]), bullets(e["bullets"])]
+    if r["projects"]:
+        out.append(heading("Projects"))
+        for x in r["projects"]:
+            out += [line(x["name"], [x["detail"]], x["dates"]), bullets(x["bullets"])]
+    if r["education"]:
+        out.append(heading("Education"))
+        for e in r["education"]:
+            out.append(line(e["school"], [e["degree"], e["location"]], e["dates"]))
+            if e["detail"]:
+                out.append(para(_e(e["detail"])))
+    for x in r["extra"]:
+        out += [heading(x["label"] or "Other"), para(_e(x["items"]))]
+    return "".join(out)
 
 
 def find_chrome() -> Optional[str]:

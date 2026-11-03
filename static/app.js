@@ -272,6 +272,8 @@ async function renderDetail() {
   pane.innerHTML = detailHtml(j, detailCache[j.id]);
   pane.scrollTop = scrollTop;
   pane.dataset.job = j.id;  // whose unsaved inputs are on screen
+  applyListHidden();
+  if (resumeDrafts[j.id]) mountEditor(j.id);
   restoreAnswers(j.id);
   const msgs = pane.querySelector(".msgs");
   if (msgs) msgs.scrollTop = msgs.scrollHeight;
@@ -359,7 +361,7 @@ function tailoredHtml(j, t) {
     </div>
     <p class="muted">This one was written before PDF/Word export existed. Regenerate it to get a one-page PDF you can edit.</p>
     <article class="md">${renderMarkdown(t.content)}</article>`;
-  if (resumeDrafts[j.id]) return editorHtml(resumeDrafts[j.id]);
+  if (resumeDrafts[j.id]) return editorHtml();
 
   const fit = t.fit || {};
   const pdf = `/api/jobs/${j.id}/tailor.pdf?v=${t.id}`;
@@ -371,100 +373,318 @@ function tailoredHtml(j, t) {
       ${fit.error ? "" : `<a class="btn small" href="${pdf}&download=1">Download PDF</a>`}
       <a class="btn small" href="/api/jobs/${j.id}/tailor.docx?v=${t.id}"
          title="Same layout and font size as the PDF. Word can wrap lines a little differently, so check it is still one page after editing.">Download Word</a>
-      <button class="btn small" data-act="copy-resume">Copy text</button>
+      <button class="btn small" data-act="copy-docs" title="Copies the resume with its formatting, ready to paste into a Google Doc">Copy for Google Docs</button>
       <button class="btn small" data-act="tailor" title="Compare again with all your resumes and answers, then write a new version">Regenerate</button>
     </div>
     ${fitLine(t.fit)}${log}${box}${preview}`;
 }
 
-// ---- resume editor: a form over the structured resume; saving re-fits and re-renders the PDF
+// ---- resume editor: click and type on the resume itself. The server's template provides the
+// page (same layout as the PDF); this code handles typing and reads the fields back.
 
-const ENTRY_FIELDS = {
-  experience: [["title", "Title"], ["company", "Company"], ["location", "Location"], ["dates", "Dates"]],
-  projects: [["name", "Name"], ["detail", "Tech / context"], ["dates", "Dates"]],
-  education: [["school", "School"], ["degree", "Degree"], ["location", "Location"], ["dates", "Dates"], ["detail", "Details (GPA, honors…)"]],
+const ENTRY_KEYS = {
+  experience: ["title", "company", "location", "dates"],
+  projects: ["name", "detail", "dates"],
+  education: ["school", "degree", "location", "dates", "detail"],
 };
-const SECTION_LABELS = { experience: ["Experience", "job"], projects: ["Projects", "project"], education: ["Education", "school"] };
 
 function blankEntry(sec) {
-  const e = Object.fromEntries(ENTRY_FIELDS[sec].map(([k]) => [k, ""]));
+  if (sec === "extra") return { label: "", items: "" };
+  const e = Object.fromEntries(ENTRY_KEYS[sec].map((k) => [k, ""]));
   if (sec !== "education") e.bullets = [];
   return e;
 }
 
-function textarea(path, value, kind, placeholder = "") {
-  const rows = Math.max(2, value.split("\n").length + 1);
-  return `<textarea data-path="${path}" data-kind="${kind}" rows="${rows}" placeholder="${esc(placeholder)}">${esc(value)}</textarea>`;
-}
-
-const labeledText = (items) => items.map((x) => (x.label ? `${x.label}: ${x.items}` : x.items)).join("\n");
-
-function editorHtml(r) {
-  const field = (path, label, value, wide = false) =>
-    `<label class="${wide ? "wide" : ""}">${label}<input data-path="${path}" value="${esc(value || "")}"></label>`;
-  const section = (sec) => {
-    const [title, noun] = SECTION_LABELS[sec];
-    const cards = r[sec].map((e, i) => `<div class="entry-card">
-        <div class="entry-fields">${ENTRY_FIELDS[sec].map(([k, label]) => field(`${sec}.${i}.${k}`, label, e[k], k === "detail")).join("")}</div>
-        ${"bullets" in e ? `<label class="wide"><span>Bullets <span class="muted">(one per line)</span></span>${textarea(`${sec}.${i}.bullets`, e.bullets.join("\n"), "lines")}</label>` : ""}
-        <button type="button" class="btn small danger" data-act="remove-entry" data-sec="${sec}" data-i="${i}">Remove ${noun}</button>
-      </div>`).join("");
-    return `<fieldset><legend>${title}</legend>${cards}
-      <button type="button" class="btn small" data-act="add-entry" data-sec="${sec}">+ Add ${noun}</button></fieldset>`;
-  };
-  const actions = `<div class="tool-row">
+function editorHtml() {
+  return `<div class="tool-row">
       <button class="btn small primary" data-act="save-resume">Save &amp; check fit</button>
       <button class="btn small" data-act="cancel-edit">Cancel</button>
-    </div>`;
-  return `${actions}
-    <p class="muted">Saving re-checks that it fits on one page and refreshes the PDF and Word files. Nothing you write is cut automatically.</p>
-    <form class="resume-editor" onsubmit="return false">
-      <fieldset><legend>Header</legend>
-        <div class="entry-fields">${field("name", "Name", r.name)}${field("headline", "Headline", r.headline)}</div>
-        <label class="wide"><span>Contact <span class="muted">(one per line)</span></span>${textarea("contact", r.contact.join("\n"), "lines")}</label>
-      </fieldset>
-      <fieldset><legend>Summary</legend>${textarea("summary", r.summary, "text")}</fieldset>
-      <fieldset><legend>Skills</legend>
-        <label class="wide"><span class="muted">One line each, as “Label: item, item”</span>${textarea("skills", labeledText(r.skills), "labeled", "Languages: Python, Go")}</label>
-      </fieldset>
-      ${section("experience")}${section("projects")}${section("education")}
-      <fieldset><legend>Other sections</legend>
-        <label class="wide"><span class="muted">One section per line, as “Title: item, item”</span>${textarea("extra", labeledText(r.extra), "labeled", "Certifications: AWS Developer")}</label>
-      </fieldset>
-    </form>
-    ${actions}`;
+    </div>
+    <p class="muted edit-hint">Click any text and type. Enter adds a bullet; Backspace on an empty one removes it. Hover a job to remove it. Dashed lines mark where pages end.</p>
+    <p class="fit" id="fit-meter"></p>
+    <div class="paper-wrap" id="paper-wrap"><iframe id="resume-frame" class="paper" title="Editable resume" scrolling="no"></iframe></div>`;
 }
 
-function formToResume(form, base) {
-  const r = { ...base, experience: [], projects: [], education: [] };
-  const lines = (v) => v.split("\n").map((l) => l.trim()).filter(Boolean);
-  form.querySelectorAll("[data-path]").forEach((el) => {
-    let v = el.value;
-    if (el.dataset.kind === "lines") v = lines(v);
-    else if (el.dataset.kind === "labeled") v = lines(v).map((l) => {
-      const i = l.indexOf(":");
-      return i > 0 && i < 40 ? { label: l.slice(0, i).trim(), items: l.slice(i + 1).trim() } : { label: "", items: l };
+const postJson = (path, body) => api(path, {
+  method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+});
+
+function frameDoc() {
+  const doc = $("#resume-frame")?.contentDocument;
+  return doc?.querySelector("[data-f]") ? doc : null;
+}
+
+function readResume(doc, base) {
+  const text = (el, key) => el.querySelector(`[data-f="${key}"]`)?.textContent.trim() ?? "";
+  const r = {
+    ...base,
+    name: text(doc, "name"),
+    headline: text(doc, "headline"),
+    summary: text(doc, "summary"),
+    contact: [...doc.querySelectorAll('[data-f="contact"]')].map((c) => c.textContent.trim()).filter(Boolean),
+    skills: [...doc.querySelectorAll(".skill-row")]
+      .map((row) => ({ label: text(row, "label"), items: text(row, "items") })).filter((x) => x.items),
+    extra: [...doc.querySelectorAll('[data-sec="extra"]')].map((x) => ({ label: text(x, "label"), items: text(x, "items") })),
+  };
+  for (const [sec, keys] of Object.entries(ENTRY_KEYS)) {
+    r[sec] = [...doc.querySelectorAll(`[data-sec="${sec}"] [data-entry]`)].map((el) => {
+      const e = Object.fromEntries(keys.map((k) => [k, text(el, k)]));
+      if (sec !== "education") e.bullets = [...el.querySelectorAll('[data-f="bullet"]')].map((b) => b.textContent.trim()).filter(Boolean);
+      return e;
     });
-    else if (el.dataset.kind === "text") v = v.trim();
-    const keys = el.dataset.path.split(".");
-    let o = r;
-    keys.slice(0, -1).forEach((k) => { o = o[k] ??= {}; });
-    o[keys[keys.length - 1]] = v;
-  });
+  }
   return r;
 }
 
 function saveDraftFromForm() {
-  const form = $("#detail .resume-editor");
   const id = $("#detail").dataset.job;
-  if (form && id in resumeDrafts) resumeDrafts[id] = formToResume(form, resumeDrafts[id]);
+  const doc = frameDoc();
+  if (doc && id in resumeDrafts) resumeDrafts[id] = readResume(doc, resumeDrafts[id]);
 }
 
 function redrawEditor() {
-  // The draft was just changed in code; drop the old form so renderDetail doesn't read it back.
-  $("#detail .resume-editor")?.remove();
+  // The draft was just changed in code; drop the old page so renderDetail doesn't read it back.
+  $("#resume-frame")?.remove();
   detailKey = "";
   renderDetail();
+}
+
+function focusEnd(el) {
+  el.focus();
+  const sel = el.ownerDocument.getSelection();
+  sel.selectAllChildren(el);
+  sel.collapseToEnd();
+}
+
+const editablesIn = (row) => (row.matches("[contenteditable]") ? [row] : [...row.querySelectorAll("[contenteditable]")]);
+
+function addRowAfter(row, text = "") {
+  const copy = row.cloneNode(true);
+  editablesIn(copy).forEach((el) => { el.textContent = ""; });
+  row.after(copy);
+  const first = editablesIn(copy)[0];
+  if (text) first.textContent = text;
+  return first;
+}
+
+function editorKeydown(e) {
+  const el = e.target;
+  if (!el.matches?.("[contenteditable]")) return;
+  const row = el.closest("[data-repeat]");
+  if (e.key === "Enter") {
+    e.preventDefault();
+    if (row) focusEnd(addRowAfter(row));
+    scheduleFitCheck();
+  } else if (e.key === "Backspace" && row && editablesIn(row).every((x) => !x.textContent)) {
+    const prev = row.previousElementSibling;
+    if (!prev?.matches("[data-repeat]") && !row.nextElementSibling?.matches("[data-repeat]")) return;
+    e.preventDefault();
+    const target = prev?.matches("[data-repeat]") ? editablesIn(prev).pop() : editablesIn(row.nextElementSibling)[0];
+    row.remove();
+    focusEnd(target);
+    scheduleFitCheck();
+  }
+}
+
+function editorPaste(e) {
+  const el = e.target;
+  if (!el.matches?.("[contenteditable]")) return;
+  e.preventDefault();
+  const lines = e.clipboardData.getData("text/plain").split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  const doc = el.ownerDocument;
+  const row = el.closest("[data-repeat]");
+  if (!row || lines.length < 2) {
+    doc.execCommand("insertText", false, lines.join(" "));
+    return;
+  }
+  // Several pasted lines become several bullets.
+  doc.execCommand("insertText", false, lines[0]);
+  let last = row;
+  lines.slice(1).forEach((line) => {
+    const added = addRowAfter(last, line);
+    last = added.closest("[data-repeat]");
+  });
+  focusEnd(editablesIn(last)[0]);
+  scheduleFitCheck();
+}
+
+function editorClick(e, id, doc) {
+  const add = e.target.closest("[data-add]");
+  const remove = e.target.closest("[data-remove]");
+  if (add) {
+    const draft = readResume(doc, resumeDrafts[id]);
+    draft[add.dataset.add].push(blankEntry(add.dataset.add));
+    resumeDrafts[id] = draft;
+    redrawEditor();
+  } else if (remove) {
+    remove.closest("[data-entry]").remove();
+    sizePaper();
+    scheduleFitCheck();
+  }
+}
+
+// Lays out page breaks the way printing does: each block goes on the next page if it would cross
+// the bottom edge, and a job's block is kept whole. Blocks are measured with non-printing parts hidden.
+function pageLayout(doc, contentPx) {
+  const bodyStyle = doc.defaultView.getComputedStyle(doc.body);
+  const start = doc.body.getBoundingClientRect().top + parseFloat(bodyStyle.paddingTop);
+  const blocks = [...doc.querySelectorAll("h1, .headline, .contact, h2, p, .entry")]
+    .filter((b) => !b.parentElement.closest(".entry") && b.offsetHeight > 0);
+  const breaks = [];
+  let offset = start;
+  let bottom = start;
+  blocks.forEach((b) => {
+    const rect = b.getBoundingClientRect();
+    if (rect.bottom - offset > contentPx && rect.top > offset) {
+      breaks.push(b);
+      offset = rect.top;
+    }
+    bottom = Math.max(bottom, rect.bottom);
+  });
+  return { pages: breaks.length + 1, breaks, room: contentPx - (bottom - offset), used: bottom - start };
+}
+
+let editorPage = null;   // sizes of the page shown in the editor
+let paperMinHeight = 0;
+
+function drawPageLines(doc) {
+  if (!editorPage) return null;
+  doc.querySelectorAll(".page-line").forEach((el) => el.remove());
+  doc.body.classList.add("measuring");
+  const layout = pageLayout(doc, editorPage.content_px);
+  doc.body.classList.remove("measuring");
+  const top = doc.body.getBoundingClientRect().top;
+  const line = (y, label, cls = "") => {
+    const el = doc.createElement("div");
+    el.className = `page-line edit-ui ${cls}`;
+    el.style.top = `${y}px`;
+    const tag = doc.createElement("span");
+    tag.textContent = label;
+    el.appendChild(tag);
+    doc.body.appendChild(el);
+  };
+  layout.breaks.forEach((b, i) => line(b.getBoundingClientRect().top - top - 3, `Page ${i + 2} starts here`));
+  // The end of the last page, so you can see how much room is left.
+  const blocks = [...doc.body.children].filter((c) => !c.matches(".page-line, .add-section"));
+  const lastBottom = Math.max(...blocks.map((c) => c.getBoundingClientRect().bottom)) - top;
+  const endY = lastBottom + Math.max(0, layout.room);
+  line(endY, `End of page ${layout.pages}`, "end");
+  paperMinHeight = endY + editorPage.margin_px;
+  return layout;
+}
+
+let paperWidth = 816;
+function sizePaper() {
+  const frame = $("#resume-frame");
+  const wrap = $("#paper-wrap");
+  const doc = frame?.contentDocument;
+  if (!doc?.body || !wrap) return;
+  const scale = Math.min(1, wrap.clientWidth / paperWidth);
+  frame.style.width = `${paperWidth}px`;
+  const height = Math.max(doc.body.offsetHeight, paperMinHeight);
+  frame.style.height = `${height}px`;
+  frame.style.transform = `scale(${scale})`;
+  wrap.style.height = `${height * scale}px`;
+}
+
+async function mountEditor(id) {
+  const frame = $("#resume-frame");
+  if (!frame || frame.srcdoc) return;
+  const level = tailorCache[id].fit?.level ?? 2;
+  const page = await postJson("/api/resume/html", { resume: resumeDrafts[id], level, editable: true });
+  if ($("#resume-frame") !== frame) return;
+  paperWidth = page.page_px;
+  editorPage = page;
+  frame.onload = () => {
+    const doc = frame.contentDocument;
+    doc.addEventListener("keydown", editorKeydown);
+    doc.addEventListener("paste", editorPaste);
+    doc.addEventListener("click", (e) => editorClick(e, id, doc));
+    doc.addEventListener("input", (e) => {
+      if (e.target.matches?.("[contenteditable]") && !e.target.textContent) e.target.innerHTML = "";  // keeps the placeholder working
+      sizePaper();
+      scheduleFitCheck();
+    });
+    sizePaper();
+    new ResizeObserver(sizePaper).observe($("#paper-wrap"));
+    scheduleFitCheck(0);
+  };
+  paperMinHeight = 0;
+  frame.srcdoc = page.html;
+}
+
+// A quick estimate while typing, from laying the page out in a hidden frame. Saving does the real check.
+async function measure(resume, level) {
+  const page = await postJson("/api/resume/html", { resume, level });
+  let frame = $("#measure-frame");
+  if (!frame) {
+    frame = document.createElement("iframe");
+    frame.id = "measure-frame";
+    frame.setAttribute("aria-hidden", "true");
+    frame.tabIndex = -1;
+    frame.style.cssText = `position:absolute;left:-9999px;top:0;width:${page.page_px}px;height:800px;visibility:hidden`;
+    document.body.appendChild(frame);
+  }
+  await new Promise((resolve) => { frame.onload = resolve; frame.srcdoc = page.html; });
+  const layout = pageLayout(frame.contentDocument, page.content_px);
+  return { ...page, pages: layout.pages, overBy: layout.used - page.content_px };
+}
+
+let fitTimer = null;
+let fitRun = 0;
+function scheduleFitCheck(delay = 300) {
+  clearTimeout(fitTimer);
+  fitTimer = setTimeout(checkFit, delay);
+}
+
+async function checkFit() {
+  const doc = frameDoc();
+  const id = $("#detail").dataset.job;
+  if (!doc || !(id in resumeDrafts)) return;
+  const run = ++fitRun;
+  const shown = drawPageLines(doc);
+  sizePaper();
+  const resume = readResume(doc, resumeDrafts[id]);
+  const current = await measure(resume, tailorCache[id].fit?.level ?? 2);
+  const count = (n) => `${n} page${n === 1 ? "" : "s"}`;
+  let text = `✓ ${count(current.pages)} at ${current.font}pt`;
+  if (current.pages === 1 && shown) text += `, about ${Math.max(0, Math.floor(shown.room / current.line_px))} line(s) of room left`;
+  let warn = false;
+  if (current.pages > 1) {
+    const tight = await measure(resume, null);
+    if (tight.pages > 1) {
+      text = `⚠ ${count(tight.pages)} even at ${tight.font}pt, the smallest size. Cut about ${Math.ceil(tight.overBy / tight.line_px)} line(s) to fit one page.`;
+      warn = true;
+    } else {
+      text = `${count(current.pages)} at ${current.font}pt. Saving will shrink the text to fit one page (${tight.font}pt at the smallest).`;
+    }
+  }
+  const meter = $("#fit-meter");
+  if (run === fitRun && meter) {
+    meter.textContent = text;
+    meter.className = `fit ${warn ? "warn" : "ok"}`;
+  }
+}
+
+function copyForDocs(id) {
+  const t = tailorCache[id];
+  const plain = (t.content || "").replace(/^#+\s*/gm, "").replace(/\*\*/g, "");
+  const html = fetch(`/api/jobs/${id}/tailor.html`).then((r) => {
+    if (!r.ok) throw new Error(r.statusText);
+    return r.text();
+  }).then((x) => new Blob([x], { type: "text/html" }));
+  return navigator.clipboard.write([new ClipboardItem({
+    "text/html": html,
+    "text/plain": new Blob([plain], { type: "text/plain" }),
+  })]).then(
+    () => setStatus("Copied with formatting. Paste it into a Google Doc."),
+    (e) => setStatus(`Could not copy: ${e.message}`, true),
+  );
+}
+
+function applyListHidden() {
+  // Editing needs the width, so the list steps aside until you save or cancel.
+  $("#main").classList.toggle("list-hidden", listHidden || selectedId in resumeDrafts);
 }
 
 async function saveResume(id) {
@@ -485,9 +705,6 @@ async function saveResume(id) {
   renderDetail();
 }
 
-function applyListHidden() {
-  $("#main").classList.toggle("list-hidden", listHidden);
-}
 
 function detailHtml(j, full) {
   const sc = scoreClass(j.score, data.threshold);
@@ -541,11 +758,11 @@ function detailHtml(j, full) {
   // With a tailored resume, show it beside the description so the two can be compared.
   const split = Boolean(j.tailored_count || tailorBusy[j.id] || tailorCache[j.id]?.messages?.length);
   if (!split) actions += `<button class="btn" data-act="tailor" title="Compare this job with all your resumes, ask about anything missing, then write a one-page resume">✎ Write tailored resume</button>`;
-  actions += `<button class="btn ghost list-toggle" data-act="toggle-list">${listHidden ? "⇥ Show job list" : "⇤ Hide job list"}</button>`;
+  if (!resumeDrafts[j.id]) actions += `<button class="btn ghost list-toggle" data-act="toggle-list">${listHidden ? "⇥ Show job list" : "⇤ Hide job list"}</button>`;
   const body = split
-    ? `<div class="split">
-        <section class="split-col"><h3 class="col-title">Job description</h3>${jd}</section>
+    ? `<div class="split ${resumeDrafts[j.id] ? "editing" : ""}">
         <section class="split-col resume-col"><h3 class="col-title">Tailored resume</h3>${tailoredHtml(j, tailorCache[j.id])}</section>
+        <section class="split-col"><h3 class="col-title">Job description</h3>${jd}</section>
       </div>`
     : `<h3 class="col-title">Job description</h3>${jd}`;
 
@@ -775,6 +992,7 @@ $("#detail").addEventListener("click", (e) => {
     case "decline": return askDecline(id);
     case "undo": return decide(id, "new");
     case "tailor": return tailor(id);
+    case "copy-docs": return copyForDocs(id);
     case "copy-resume": return navigator.clipboard.writeText(tailorCache[id]?.content || "");
     case "edit-resume":
       resumeDrafts[id] = structuredClone(tailorCache[id].resume);
