@@ -7,8 +7,8 @@ Your decisions are fed back into the next ranking. It can also write a resume ta
 
 ```
 job APIs ──► SQLite ──► keyword filter ──► LLM scores + gaps ──► web page
- (remotive, arbeitnow,      (drop reason        (uses resume +           apply ↗ / not interested
-  greenhouse, lever, ashby)  stored)             your past decisions)       (reason) ──┐
+ (greenhouse, lever, ashby,  (drop reason        (uses resume +           apply ↗ / not interested
+  workable, remotive, …)      stored)             your past decisions)       (reason) ──┐
                                    ▲                                                     │
                                    └──────────────── feedback ◄──────────────────────────┘
 ```
@@ -71,21 +71,42 @@ wrong. Something like Qwen2.5 7B/14B or Llama 3.1 8B works reasonably. The app t
 
 ## Configuration
 
+### Job sources
+
+| Kind | Sources | How it finds jobs |
+|---|---|---|
+| Keyword search | MyGreenhouse (`greenhouse_search`), Remotive | Searches by the keywords you set (or type in the Fetch dialog) |
+| Aggregator | Arbeitnow | Pulls recent jobs; your keyword filter narrows them |
+| Company boards | Greenhouse, Lever, Ashby, Workable | No search API: pulls every open job from each company in your list |
+
+**Company lists** live in `companies/<platform>.txt`, one company per line. You can write the
+company's board name (`stripe`) or paste a careers URL (`https://jobs.lever.co/palantir`) and the
+name is read from it. Lines starting with `#` are comments. After a run, the status bar lists any
+company that wasn't found on its platform, which usually means a typo.
+
+To add another platform, write a `_fetch_<name>(client, slug)` in
+[app/sources/boards.py](app/sources/boards.py), add it to `PLATFORMS`, create `companies/<name>.txt`,
+and enable it under `sources:` in `config.yaml`.
+
+### config.yaml
+
 `config.yaml` sets:
-- **sources**: search queries, and which company boards to pull (Greenhouse, Lever and Ashby slugs come from the careers URL).
+- **sources**: which sources are on, search keywords and parameters, and per-platform options
+  (`companies_file`, `concurrency`).
 - **filter**: title include/exclude words, description phrases that drop a job (such as "unable to sponsor"),
   location, max years of experience, max posting age.
 - **llm**: jobs per run, `concurrency` (keep at 1–2 for a single Colab GPU), match threshold, and
   `max_jd_chars` (long job descriptions are cut to this length so they fit a small model's context window).
 
-To add a job source, write a `fetch_<name>(client, cfg)` in [app/sources.py](app/sources.py) that returns
-normalized job dicts, register it in `SOURCES`, and add a block under `sources:` in `config.yaml`.
-
 ## Layout
 
 | File | Purpose |
 |---|---|
-| [app/sources.py](app/sources.py) | Job API adapters |
+| [companies/](companies/) | Your company lists, one file per platform |
+| [app/sources/boards.py](app/sources/boards.py) | Greenhouse, Lever, Ashby, Workable (per-company) |
+| [app/sources/greenhouse_search.py](app/sources/greenhouse_search.py) | MyGreenhouse keyword search (needs your login cookie) |
+| [app/sources/aggregators.py](app/sources/aggregators.py) | Remotive, Arbeitnow |
+| [app/jd_parse.py](app/jd_parse.py) | Job description HTML → Markdown, must-have vs nice-to-have split |
 | [app/filters.py](app/filters.py) | Keyword pre-filter |
 | [app/llm.py](app/llm.py) | LLM connection (Ollama / OpenAI-compatible), scoring and resume tailoring |
 | [app/pipeline.py](app/pipeline.py) | fetch → filter → score |

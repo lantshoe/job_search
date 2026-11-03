@@ -1,0 +1,10 @@
+# Greenhouse companies, one per line.
+# Write the board name, or paste any careers / job URL and the name is read from it:
+#   stripe
+#   https://job-boards.greenhouse.io/stripe
+#   https://boards.greenhouse.io/stripe/jobs/1234567
+# Anything after # is a comment.
+
+stripe
+airbnb
+databricks
